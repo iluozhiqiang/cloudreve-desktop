@@ -169,3 +169,59 @@ impl EventBlocker {
         self.len() == 0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::EventBlocker;
+    use notify_debouncer_full::notify::{
+        Event,
+        event::{CreateKind, EventKind, ModifyKind, RemoveKind},
+    };
+    use std::path::PathBuf;
+
+    #[test]
+    fn blocks_registered_event_exact_number_of_times() {
+        let blocker = EventBlocker::new();
+        let path = PathBuf::from("/tmp/test.txt");
+        blocker.register(&EventKind::Modify(ModifyKind::Any), path.clone(), 2);
+
+        assert!(blocker.should_block(&EventKind::Modify(ModifyKind::Any), &path));
+        assert!(blocker.should_block(&EventKind::Modify(ModifyKind::Any), &path));
+        assert!(!blocker.should_block(&EventKind::Modify(ModifyKind::Any), &path));
+    }
+
+    #[test]
+    fn filter_events_only_removes_blocked_paths() {
+        let blocker = EventBlocker::new();
+        let blocked_path = PathBuf::from("/tmp/blocked.txt");
+        let kept_path = PathBuf::from("/tmp/kept.txt");
+        blocker.register_once(&EventKind::Create(CreateKind::Any), blocked_path.clone());
+
+        let events = vec![
+            Event {
+                kind: EventKind::Create(CreateKind::Any),
+                paths: vec![blocked_path],
+                attrs: Default::default(),
+            },
+            Event {
+                kind: EventKind::Create(CreateKind::Any),
+                paths: vec![kept_path.clone()],
+                attrs: Default::default(),
+            },
+        ];
+
+        let filtered = blocker.filter_events(events, &EventKind::Create(CreateKind::Any));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].paths, vec![kept_path]);
+    }
+
+    #[test]
+    fn different_event_kinds_do_not_consume_each_other() {
+        let blocker = EventBlocker::new();
+        let path = PathBuf::from("/tmp/test.txt");
+        blocker.register_once(&EventKind::Remove(RemoveKind::Any), path.clone());
+
+        assert!(!blocker.should_block(&EventKind::Modify(ModifyKind::Any), &path));
+        assert!(blocker.should_block(&EventKind::Remove(RemoveKind::Any), &path));
+    }
+}

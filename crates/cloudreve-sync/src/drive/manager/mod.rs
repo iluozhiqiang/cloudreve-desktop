@@ -8,8 +8,10 @@ use crate::drive::commands::ManagerCommand;
 use crate::drive::mounts::{Credentials, DriveConfig, Mount};
 use crate::EventBroadcaster;
 use crate::inventory::InventoryDb;
+use crate::platform_provider;
 use crate::tasks::TaskProgress;
 use anyhow::{Context, Result};
+use cloudreve_platforms_api::PlatformProvider;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,6 +23,7 @@ pub struct DriveManager {
     pub(super) drives: Arc<RwLock<HashMap<String, Arc<Mount>>>>,
     config_dir: PathBuf,
     pub(super) inventory: Arc<InventoryDb>,
+    pub(super) platform: Arc<dyn PlatformProvider>,
     pub(super) command_tx: mpsc::UnboundedSender<ManagerCommand>,
     pub(super) command_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<ManagerCommand>>>>,
     pub(super) processor_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -30,6 +33,13 @@ pub struct DriveManager {
 impl DriveManager {
     /// Create a new DriveManager instance
     pub fn new(event_broadcaster: Arc<EventBroadcaster>) -> Result<Self> {
+        Self::new_with_platform(event_broadcaster, platform_provider()?)
+    }
+
+    pub fn new_with_platform(
+        event_broadcaster: Arc<EventBroadcaster>,
+        platform: Arc<dyn PlatformProvider>,
+    ) -> Result<Self> {
         let config_dir = Self::get_config_dir()?;
 
         // Ensure config directory exists
@@ -44,6 +54,7 @@ impl DriveManager {
             config_dir,
             drives: Arc::new(RwLock::new(HashMap::new())),
             inventory: Arc::new(InventoryDb::new().context("Failed to create inventory database")?),
+            platform,
             command_tx,
             command_rx: Arc::new(Mutex::new(Some(command_rx))),
             processor_handle: Arc::new(Mutex::new(None)),
@@ -78,11 +89,7 @@ impl DriveManager {
 
         tracing::debug!(target: "drive", path = %config_file.display(), "Loading drive configurations");
 
-        let content =
-            fs::read_to_string(&config_file).context("Failed to read drive config file")?;
-
-        let state: DriveState =
-            serde_json::from_str(&content).context("Failed to parse drive config")?;
+        let state: DriveState = DriveState::read_from_path(&config_file)?;
 
         // Add drives to manager
         let mut count = 0;
@@ -117,9 +124,7 @@ impl DriveManager {
             new_state.drives.push(config);
         }
 
-        let content =
-            serde_json::to_string_pretty(&new_state).context("Failed to serialize drive state")?;
-        fs::write(&config_file, content).context("Failed to write drive config file")?;
+        new_state.write_to_path(&config_file)?;
 
         tracing::info!(target: "drive", count = new_state.drives.len(), "Persisted drive(s) to config");
 
@@ -154,9 +159,9 @@ impl DriveManager {
         {
             match favicon::fetch_and_save_favicon(&config.instance_url).await {
                 Ok(result) => {
-                    tracing::info!(target: "drive", ico_path = %result.ico_path, raw_path = %result.raw_path, "Favicon fetched successfully");
-                    config.icon_path = Some(result.ico_path);
-                    config.raw_icon_path = Some(result.raw_path);
+                    tracing::info!(target: "drive", shell_icon_path = %result.shell_icon_path, display_icon_path = %result.display_icon_path, "Favicon fetched successfully");
+                    config.icon_path = Some(result.shell_icon_path);
+                    config.raw_icon_path = Some(result.display_icon_path);
                 }
                 Err(e) => {
                     tracing::warn!(target: "drive", error = %e, "Failed to fetch favicon, continuing without icon");
@@ -169,6 +174,7 @@ impl DriveManager {
             config.clone(),
             self.inventory.clone(),
             self.command_tx.clone(),
+            self.platform.clone(),
         )
         .await;
         if let Err(e) = mount.start().await {
@@ -325,17 +331,17 @@ impl DriveManager {
         let mut config = mount.config.write().await;
 
         // Clear old icon files if they exist
-        if let Some(ref ico_path) = config.icon_path {
-            if std::path::Path::new(ico_path).exists() {
-                if let Err(e) = std::fs::remove_file(ico_path) {
-                    tracing::warn!(target: "drive::manager", drive_id = %id, error = %e, "Failed to remove old ICO file");
+        if let Some(ref shell_icon_path) = config.icon_path {
+            if std::path::Path::new(shell_icon_path).exists() {
+                if let Err(e) = std::fs::remove_file(shell_icon_path) {
+                    tracing::warn!(target: "drive::manager", drive_id = %id, error = %e, "Failed to remove old shell icon file");
                 }
             }
         }
-        if let Some(ref raw_path) = config.raw_icon_path {
-            if std::path::Path::new(raw_path).exists() {
-                if let Err(e) = std::fs::remove_file(raw_path) {
-                    tracing::warn!(target: "drive::manager", drive_id = %id, error = %e, "Failed to remove old raw icon file");
+        if let Some(ref display_icon_path) = config.raw_icon_path {
+            if std::path::Path::new(display_icon_path).exists() {
+                if let Err(e) = std::fs::remove_file(display_icon_path) {
+                    tracing::warn!(target: "drive::manager", drive_id = %id, error = %e, "Failed to remove old display icon file");
                 }
             }
         }
@@ -352,9 +358,9 @@ impl DriveManager {
         // Fetch new favicon
         match favicon::fetch_and_save_favicon(&instance_url).await {
             Ok(result) => {
-                tracing::info!(target: "drive::manager", drive_id = %id, ico_path = %result.ico_path, raw_path = %result.raw_path, "Favicon re-fetched successfully");
-                config.icon_path = Some(result.ico_path);
-                config.raw_icon_path = Some(result.raw_path);
+                tracing::info!(target: "drive::manager", drive_id = %id, shell_icon_path = %result.shell_icon_path, display_icon_path = %result.display_icon_path, "Favicon re-fetched successfully");
+                config.icon_path = Some(result.shell_icon_path);
+                config.raw_icon_path = Some(result.display_icon_path);
             }
             Err(e) => {
                 tracing::warn!(target: "drive::manager", drive_id = %id, error = %e, "Failed to re-fetch favicon, continuing without icon");
@@ -465,18 +471,18 @@ impl DriveManager {
         })
     }
 
-    /// Get drive status by sync root ID (CFAPI ID) for the Windows Shell Status UI.
+    /// Get drive status by mount identifier for external desktop status surfaces.
     ///
     /// # Arguments
-    /// * `syncroot_id` - The sync root ID string (e.g., "cloudreve<hash>!S-1-5-21-xxx!user_id")
+    /// * `mount_id` - The platform mount identifier string
     ///
     /// # Returns
     /// * `Ok(Some(DriveStatusUI))` - Drive status if found
-    /// * `Ok(None)` - No drive found with the given sync root ID
+    /// * `Ok(None)` - No drive found with the given mount identifier
     /// * `Err` - An error occurred
-    pub async fn get_drive_status_by_syncroot_id(
+    pub async fn get_drive_status_by_mount_id(
         &self,
-        syncroot_id: &str,
+        mount_id: &str,
     ) -> Result<Option<DriveStatusUI>> {
         let read_guard = self.drives.read().await;
 
@@ -484,9 +490,8 @@ impl DriveManager {
         let mut found_mount: Option<&Arc<Mount>> = None;
         for mount in read_guard.values() {
             let config = mount.config.read().await;
-            if let Some(ref sync_root) = config.sync_root_id {
-                let sync_root_str = sync_root.to_os_string().to_string_lossy().to_string();
-                if sync_root_str == syncroot_id {
+            if let Some(ref configured_mount_id) = config.mount_id {
+                if configured_mount_id == mount_id {
                     drop(config);
                     found_mount = Some(mount);
                     break;
@@ -497,7 +502,7 @@ impl DriveManager {
         let mount = match found_mount {
             Some(m) => m,
             None => {
-                tracing::debug!(target: "drive::manager", syncroot_id = %syncroot_id, "No drive found for sync root ID");
+                tracing::debug!(target: "drive::manager", mount_id = %mount_id, "No drive found for mount ID");
                 return Ok(None);
             }
         };

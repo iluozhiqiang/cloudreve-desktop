@@ -1,12 +1,67 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use cloudreve_api::models::uri::CrUri;
+use cloudreve_api::models::uri::{CrUri, CR_URI_PREFIX};
+use cloudreve_platforms_api::VirtualFileState;
 use url::Url;
-use widestring::U16CString;
-use windows::Win32::UI::Shell::{SHCNE_ID, SHCNF_PATHW, SHChangeNotify};
 
 use crate::drive::mounts::DriveConfig;
+use crate::inventory::{FileMetadata, InventoryDb};
+
+const MTIME_TOLERANCE_SECS: i64 = 1;
+
+/// Canonical Cloudreve URI from the last [`FileResponse.path`] stored in inventory metadata.
+/// Used for delete/move/upload API calls when the URI derived from local path + sync root may not
+/// match the server (e.g. shared / collaboration folders, redirects).
+pub const INVENTORY_REMOTE_URI_KEY: &str = "sys:desktop_inventory_uri";
+
+/// Resolve the Cloudreve URI for a local path, preferring the last known server `FileResponse.path`
+/// from inventory when present.
+pub fn cr_uri_for_fs_event_path(
+    path: PathBuf,
+    sync_root: PathBuf,
+    remote_base: String,
+    inventory: &InventoryDb,
+) -> Result<CrUri> {
+    let debug_enabled = tracing::enabled!(target: "drive::utils", tracing::Level::DEBUG);
+    if debug_enabled {
+        tracing::debug!(
+            target: "drive::utils",
+            local_path = %path.display(),
+            sync_root = %sync_root.display(),
+            remote_base = %remote_base,
+            "Resolving CR URI for fs event path"
+        );
+    }
+
+    if let Some(s) = path.to_str() {
+        if let Ok(Some(meta)) = inventory.query_by_path(s) {
+            if let Some(uri_str) = meta.metadata.get(INVENTORY_REMOTE_URI_KEY) {
+                if !uri_str.is_empty() {
+                    if debug_enabled {
+                        tracing::debug!(
+                            target: "drive::utils",
+                            local_path = %path.display(),
+                            inventory_remote_uri = %uri_str,
+                            "Using inventory-stored remote URI for fs event path"
+                        );
+                    }
+                    return CrUri::new(uri_str);
+                }
+            }
+        }
+    }
+
+    let uri = local_path_to_cr_uri(path, sync_root, remote_base)?;
+    if debug_enabled {
+        tracing::debug!(
+            target: "drive::utils",
+            resolved_remote_uri = %uri.to_string(),
+            "Using derived CR URI fallback for fs event path"
+        );
+    }
+    Ok(uri)
+}
 
 pub fn local_path_to_cr_uri(path: PathBuf, root: PathBuf, remote_base: String) -> Result<CrUri> {
     let mut base = CrUri::new(&remote_base)?;
@@ -53,6 +108,58 @@ pub fn remote_path_to_local_relative_path(
     Ok(PathBuf::from(relative_path))
 }
 
+/// Map `from` / `to` fields in server file push (SSE) events to a local path under `sync_root`.
+///
+/// The server may send either a full `cloudreve://...` URI or a slash-led path relative to the
+/// subscribed mount. The previous implementation only handled the latter, which breaks
+/// **web 删除 → 本地仍残留** when payloads use full URIs.
+pub fn local_path_from_remote_file_event_field(
+    sync_root: &Path,
+    remote_base: &str,
+    field: &str,
+) -> Result<PathBuf> {
+    let field = field.trim();
+    if field.is_empty() {
+        return Err(anyhow::anyhow!("empty remote file event path"));
+    }
+    if field.starts_with(CR_URI_PREFIX) {
+        let file_uri = CrUri::new(field)?;
+        let base_uri = CrUri::new(remote_base)?;
+        let rel = remote_path_to_local_relative_path(&file_uri, &base_uri)?;
+        Ok(sync_root.join(rel))
+    } else {
+        let relative_path: PathBuf = field
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+        Ok(sync_root.join(relative_path))
+    }
+}
+
+pub fn local_state_matches_inventory(
+    local: &VirtualFileState,
+    inventory: Option<&FileMetadata>,
+) -> bool {
+    let Some(inventory) = inventory else {
+        return false;
+    };
+
+    if !local.exists || local.is_directory != inventory.is_folder {
+        return false;
+    }
+
+    if !inventory.is_folder && local.file_size != Some(inventory.size as u64) {
+        return false;
+    }
+
+    let Some(last_modified_unix) = local.last_modified_unix else {
+        return false;
+    };
+
+    (last_modified_unix - inventory.updated_at).abs() <= MTIME_TOLERANCE_SECS
+}
+
 /// Generate a URL to view a folder or file online.
 ///
 /// For folders: pass the folder path as `folder_path` and None for `open_file`
@@ -92,16 +199,141 @@ pub fn recycle_bin_url(config: &DriveConfig) -> Result<String> {
     Ok(base.to_string())
 }
 
-// notify_shell_change notify the shell to refresh the file or directory
-pub fn notify_shell_change(path: &PathBuf, event: SHCNE_ID) -> Result<()> {
-    let utf16_path = U16CString::from_os_str(path.as_path())?;
-    unsafe {
-        SHChangeNotify(
-            event,
-            SHCNF_PATHW,
-            Some(utf16_path.as_ptr() as *const _),
-            None,
-        );
+#[cfg(test)]
+mod tests {
+    use super::{cr_uri_for_fs_event_path, local_path_to_cr_uri, local_state_matches_inventory};
+    use crate::inventory::{FileMetadata, InventoryDb, MetadataEntry};
+    use cloudreve_platforms_api::{LocalAvailability, VirtualFileState};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    fn sample_state() -> VirtualFileState {
+        VirtualFileState {
+            exists: true,
+            is_directory: false,
+            file_size: Some(42),
+            last_modified_unix: Some(1_700_000_000),
+            is_virtual_placeholder: false,
+            in_sync: false,
+            partially_on_disk: false,
+            local_availability: LocalAvailability::Unspecified,
+            children_present: false,
+        }
     }
-    Ok(())
+
+    fn sample_inventory() -> FileMetadata {
+        FileMetadata {
+            id: 1,
+            drive_id: Uuid::nil(),
+            is_folder: false,
+            local_path: "/tmp/test.txt".to_string(),
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+            etag: "etag".to_string(),
+            metadata: Default::default(),
+            props: None,
+            permissions: String::new(),
+            shared: false,
+            size: 42,
+            conflict_state: None,
+        }
+    }
+
+    #[test]
+    fn matches_inventory_with_exact_timestamp() {
+        let state = sample_state();
+        let inventory = sample_inventory();
+        assert!(local_state_matches_inventory(&state, Some(&inventory)));
+    }
+
+    #[test]
+    fn matches_inventory_with_one_second_tolerance() {
+        let state = sample_state();
+        let mut inventory = sample_inventory();
+        inventory.updated_at += 1;
+        assert!(local_state_matches_inventory(&state, Some(&inventory)));
+    }
+
+    #[test]
+    fn rejects_inventory_when_timestamp_gap_is_too_large() {
+        let state = sample_state();
+        let mut inventory = sample_inventory();
+        inventory.updated_at += 2;
+        assert!(!local_state_matches_inventory(&state, Some(&inventory)));
+    }
+
+    #[test]
+    fn ignores_folder_size_but_requires_folder_shape_match() {
+        let mut state = sample_state();
+        state.is_directory = true;
+        state.file_size = Some(999);
+
+        let mut inventory = sample_inventory();
+        inventory.is_folder = true;
+        inventory.size = 0;
+
+        assert!(local_state_matches_inventory(&state, Some(&inventory)));
+    }
+
+    /// When inventory holds the server `FileResponse.path`, delete/move must use it — path-derived
+    /// URIs can differ for shared/collaboration roots.
+    #[test]
+    fn cr_uri_for_delete_prefers_inventory_remote_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = InventoryDb::with_path(dir.path().join("meta.db")).unwrap();
+        let sync_root = dir.path().join("sync");
+        std::fs::create_dir_all(&sync_root).unwrap();
+        let local_file = sync_root.join("sub").join("f.txt");
+        std::fs::create_dir_all(local_file.parent().unwrap()).unwrap();
+        let local_str = local_file.to_string_lossy().to_string();
+
+        let remote_base = "cloudreve://my/root".to_string();
+        let canonical = "cloudreve://share/collab/actual";
+
+        let mut meta = HashMap::new();
+        meta.insert(
+            super::INVENTORY_REMOTE_URI_KEY.to_string(),
+            canonical.to_string(),
+        );
+
+        let entry = MetadataEntry::new(Uuid::new_v4(), local_str, false).with_metadata(meta);
+        db.upsert(&entry).unwrap();
+
+        let uri = cr_uri_for_fs_event_path(
+            local_file.clone(),
+            sync_root.clone(),
+            remote_base.clone(),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(uri.to_string(), canonical);
+
+        let derived = local_path_to_cr_uri(local_file, sync_root, remote_base).unwrap();
+        assert_ne!(derived.to_string(), canonical);
+    }
+
+    #[test]
+    fn remote_file_event_relative_field_maps_under_sync_root() {
+        let sync = PathBuf::from("/tmp/cr-sync-root");
+        let p = super::local_path_from_remote_file_event_field(
+            &sync,
+            "cloudreve://my/mount",
+            "/sub/f.txt",
+        )
+        .unwrap();
+        assert_eq!(p, sync.join("sub").join("f.txt"));
+    }
+
+    #[test]
+    fn remote_file_event_full_uri_maps_under_sync_root() {
+        let sync = PathBuf::from("/tmp/cr-sync-root");
+        let p = super::local_path_from_remote_file_event_field(
+            &sync,
+            "cloudreve://my/mount",
+            "cloudreve://my/mount/sub/f.txt",
+        )
+        .unwrap();
+        assert_eq!(p, sync.join("sub").join("f.txt"));
+    }
 }

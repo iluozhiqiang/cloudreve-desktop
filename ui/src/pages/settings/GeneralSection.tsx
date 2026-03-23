@@ -213,6 +213,10 @@ interface GeneralSettings {
   language: string | null;
 }
 
+interface PlatformCapabilities {
+  auto_start: boolean;
+}
+
 const LOG_LEVELS = [
   { value: "trace", label: "Trace" },
   { value: "debug", label: "Debug" },
@@ -231,6 +235,7 @@ const MAX_FILES_OPTIONS = [
 export default function GeneralSection() {
   const { t, i18n } = useTranslation();
   const [autoStart, setAutoStart] = useState(true);
+  const [supportsAutoStart, setSupportsAutoStart] = useState(false);
   const [notifyCredentialExpired, setNotifyCredentialExpired] = useState(true);
   const [notifyFileConflict, setNotifyFileConflict] = useState(true);
   const [fastPopupLaunch, setFastPopupLaunch] = useState(true);
@@ -244,11 +249,15 @@ export default function GeneralSection() {
   useEffect(() => {
     const loadSettings = async () => {
       try {
-        const [enabled, settings] = await Promise.all([
-          invoke<boolean>("get_auto_start_enabled"),
+        const [capabilities, settings] = await Promise.all([
+          invoke<PlatformCapabilities>("get_platform_capabilities"),
           invoke<GeneralSettings>("get_general_settings"),
         ]);
-        setAutoStart(enabled);
+        setSupportsAutoStart(capabilities.auto_start);
+        if (capabilities.auto_start) {
+          const enabled = await invoke<boolean>("get_auto_start_enabled");
+          setAutoStart(enabled);
+        }
         setNotifyCredentialExpired(settings.notify_credential_expired);
         setNotifyFileConflict(settings.notify_file_conflict);
         setFastPopupLaunch(settings.fast_popup_launch);
@@ -267,6 +276,9 @@ export default function GeneralSection() {
   }, []);
 
   const handleAutoStartChange = async (checked: boolean) => {
+    if (!supportsAutoStart) {
+      return;
+    }
     const previousValue = autoStart;
     setAutoStart(checked);
     try {
@@ -378,14 +390,16 @@ export default function GeneralSection() {
   return (
     <Box>
       <SettingsGroup title={t("settings.launchSettings")}>
-        <SettingItem
-          title={t("settings.autoStart")}
-          description={t("settings.autoStartDescription")}
-          checked={autoStart}
-          onChange={handleAutoStartChange}
-          disabled={loading}
-          isLast={false}
-        />
+        {supportsAutoStart && (
+          <SettingItem
+            title={t("settings.autoStart")}
+            description={t("settings.autoStartDescription")}
+            checked={autoStart}
+            onChange={handleAutoStartChange}
+            disabled={loading}
+            isLast={false}
+          />
+        )}
         <SettingItem
           title={t("settings.fastPopupLaunch")}
           description={t("settings.fastPopupLaunchDescription")}

@@ -1,0 +1,12 @@
+[package]
+name = "cloudreve-platforms-macos"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+cloudreve-app-config = { path = "../../app-config" }
+cloudreve-platforms-api = { path = "../api" }
+filetime = "0.2"
+showfile = "0.1"
+tracing = "0.1"

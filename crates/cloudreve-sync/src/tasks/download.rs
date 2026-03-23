@@ -1,11 +1,11 @@
-//! Download task implementation for downloading remote files to local placeholders.
+//! Download task implementation for downloading remote files to local placeholders or real files.
 //!
 //! This module provides a download task that:
 //! - Downloads file content from remote server to a temporary location
 //! - Tracks download progress with speed and ETA calculation
-//! - Replaces the placeholder file content atomically when finished
-//! - Uses CrPlaceholder to convert and mark the file as in-sync
-//! - Only operates on hydrated placeholder files
+//! - Replaces the local file content atomically when finished
+//! - Uses CrPlaceholder to refresh local metadata and inventory
+//! - Supports both placeholder-backed and real-file sync modes
 
 use std::{
     path::PathBuf,
@@ -27,13 +27,25 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    cfapi::placeholder::LocalFileInfo,
     drive::{placeholder::CrPlaceholder, utils::local_path_to_cr_uri},
     inventory::{FileMetadata, InventoryDb},
+    platform_provider,
     tasks::queue::QueuedTask,
 };
+use cloudreve_platforms_api::{VirtualFileMode, VirtualFileState};
 
 use super::types::TaskProgress;
+
+fn build_download_temp_path(local_path: &PathBuf, task_id: &str) -> Result<PathBuf> {
+    let file_name = local_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("failed to get local file name for temp path")?;
+    let parent = local_path
+        .parent()
+        .context("failed to get local parent directory for temp path")?;
+    Ok(parent.join(format!(".{file_name}.cloudreve-download-{task_id}.tmp")))
+}
 
 /// Progress tracker for download operations.
 /// Uses atomic counters for thread-safe byte tracking and sliding window for speed calculation.
@@ -167,7 +179,7 @@ pub struct DownloadTask<'a> {
     sync_path: PathBuf,
     remote_base: String,
     task: &'a QueuedTask,
-    local_file_info: Option<LocalFileInfo>,
+    local_file_info: Option<VirtualFileState>,
     inventory_meta: Option<FileMetadata>,
     /// Latest file info fetched from remote before download
     remote_file_info: Option<cloudreve_api::models::explorer::FileResponse>,
@@ -209,8 +221,12 @@ impl<'a> DownloadTask<'a> {
 
     /// Execute the download task
     pub async fn execute(&mut self) -> Result<()> {
+        let virtual_file_mode = platform_provider()?.virtual_files().mode();
+
         // Get local file info
-        let local_file_info = LocalFileInfo::from_path(&self.task.payload.local_path)
+        let local_file_info = platform_provider()?
+            .virtual_file_ops()
+            .query_local_state(&self.task.payload.local_path)
             .context("failed to get local file info")?;
 
         if !local_file_info.exists {
@@ -233,8 +249,8 @@ impl<'a> DownloadTask<'a> {
             return Ok(());
         }
 
-        // Check if file is a placeholder and is hydrated (has content on disk)
-        if !local_file_info.is_placeholder() {
+        // Placeholder-specific hydration checks do not apply to real-file mode.
+        if virtual_file_mode != VirtualFileMode::None && !local_file_info.is_virtual_placeholder() {
             info!(
                 target: "tasks::download",
                 task_id = %self.task.task_id,
@@ -246,7 +262,7 @@ impl<'a> DownloadTask<'a> {
 
         // partial_on_disk means the file content is NOT fully present locally
         // We need the file to be hydrated (NOT partial_on_disk) to replace its content
-        if local_file_info.partial_on_disk() {
+        if virtual_file_mode != VirtualFileMode::None && local_file_info.is_partially_on_disk() {
             info!(
                 target: "tasks::download",
                 task_id = %self.task.task_id,
@@ -345,9 +361,7 @@ impl<'a> DownloadTask<'a> {
         );
 
         // Create temp file for download
-        let temp_dir = std::env::temp_dir();
-        let temp_file_name = format!("cloudreve_download_{}", self.task.task_id);
-        let temp_path = temp_dir.join(&temp_file_name);
+        let temp_path = build_download_temp_path(local_path, &self.task.task_id)?;
 
         // Clean up any existing temp file
         if temp_path.exists() {
@@ -471,54 +485,13 @@ impl<'a> DownloadTask<'a> {
             "Replacing placeholder content"
         );
 
-        // Use Windows ReplaceFileW for atomic replacement
-        // This preserves file attributes and provides atomicity
-        #[cfg(windows)]
-        {
-            use std::ffi::OsStr;
-            use std::os::windows::ffi::OsStrExt;
-            use windows::Win32::Storage::FileSystem::{REPLACE_FILE_FLAGS, ReplaceFileW};
-            use windows::core::PCWSTR;
-
-            // Convert paths to wide strings
-            let local_wide: Vec<u16> = OsStr::new(local_path)
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-            let temp_wide: Vec<u16> = OsStr::new(temp_path)
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-
-            // ReplaceFileW replaces the destination with the source
-            // The source file is deleted after the operation
-            let result = unsafe {
-                ReplaceFileW(
-                    PCWSTR::from_raw(local_wide.as_ptr()),
-                    PCWSTR::from_raw(temp_wide.as_ptr()),
-                    PCWSTR::null(),        // No backup file
-                    REPLACE_FILE_FLAGS(0), // No flags
-                    None,                  // Reserved
-                    None,                  // Reserved
-                )
-            };
-
-            if let Err(e) = result {
-                // If ReplaceFileW fails, fall back to copy + delete
-                warn!(
-                    target: "tasks::download",
-                    task_id = %self.task.task_id,
-                    error = ?e,
-                    "ReplaceFileW failed, falling back to copy"
-                );
-                std::fs::copy(temp_path, local_path)
-                    .context("failed to copy temp file to local path")?;
-            }
-        }
-
-        #[cfg(not(windows))]
-        {
-            // On non-Windows, just copy the file
+        if let Err(e) = std::fs::rename(temp_path, local_path) {
+            warn!(
+                target: "tasks::download",
+                task_id = %self.task.task_id,
+                error = ?e,
+                "Atomic rename failed, falling back to copy"
+            );
             std::fs::copy(temp_path, local_path)
                 .context("failed to copy temp file to local path")?;
         }
@@ -542,5 +515,21 @@ impl<'a> DownloadTask<'a> {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_download_temp_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn build_temp_path_next_to_target_file() {
+        let local_path = PathBuf::from("/tmp/cloudreve/test.txt");
+        let temp_path = build_download_temp_path(&local_path, "task-123").unwrap();
+        assert_eq!(
+            temp_path,
+            PathBuf::from("/tmp/cloudreve/.test.txt.cloudreve-download-task-123.tmp")
+        );
     }
 }

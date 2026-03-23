@@ -1,43 +1,22 @@
 use crate::{
-    cfapi::{
-        metadata::Metadata,
-        placeholder::{ConvertOptions, LocalFileInfo, OpenOptions, UpdateOptions},
-        placeholder_file::PlaceholderFile,
-    },
-    drive::utils::notify_shell_change,
     inventory::{FileMetadata, InventoryDb, MetadataEntry},
+    platform_provider,
 };
 use anyhow::{Context, Result};
 use chrono::DateTime;
 use cloudreve_api::models::explorer::{FileResponse, file_type};
-use nt_time::FileTime;
+use cloudreve_platforms_api::{
+    VirtualFileMetadata, VirtualFileState, VirtualPlaceholderSpec,
+};
 use std::{
     ffi::OsString,
     path::PathBuf,
     sync::Arc,
 };
 use uuid::Uuid;
-use widestring::U16CString;
-use windows::{
-    Win32::{
-        Foundation::E_FAIL,
-        Storage::EnhancedStorage::PKEY_LastSyncError,
-        System::Variant::VT_UI4,
-        UI::Shell::{
-            IShellItem2,
-            PropertiesSystem::{
-                GPS_EXTRINSICPROPERTIESONLY, GPS_READWRITE, IPropertyStore,
-            },
-            SHCNE_CREATE, SHCNE_DELETE, SHCNE_MKDIR,
-            SHCreateItemFromParsingName,
-        },
-    },
-    core::PCWSTR,
-};
-use windows_core::PROPVARIANT;
 
 pub struct CrPlaceholder {
-    pub local_file_info: LocalFileInfo,
+    pub local_file_info: VirtualFileState,
 
     local_path: PathBuf,
     sync_root: PathBuf,
@@ -60,8 +39,9 @@ impl CrPlaceholder {
             drive_id,
             file_meta: None,
             options: 0,
-            local_file_info: LocalFileInfo::from_path(&local_path.clone())
-                .unwrap_or(LocalFileInfo::missing()),
+            local_file_info: platform_provider()
+                .and_then(|platform| platform.virtual_file_ops().query_local_state(&local_path))
+                .unwrap_or_else(|_| VirtualFileState::missing()),
         }
     }
 
@@ -89,14 +69,11 @@ impl CrPlaceholder {
     }
 
     pub fn delete_placeholder(&self, inventory: Arc<InventoryDb>) -> Result<()> {
-        // Delete local file/folder if it exists
-        if self.local_file_info.exists {
-            if self.local_path.is_dir() {
-                std::fs::remove_dir_all(&self.local_path)
-                    .context("failed to delete local directory")?;
-            } else {
-                std::fs::remove_file(&self.local_path).context("failed to delete local file")?;
-            }
+        if let Ok(platform) = platform_provider() {
+            platform
+                .virtual_file_ops()
+                .remove_placeholder(&self.local_path)
+                .context("failed to remove local placeholder")?;
         }
 
         // Remove from inventory
@@ -107,10 +84,6 @@ impl CrPlaceholder {
         inventory
             .batch_delete_by_path(vec![path_str])
             .context("failed to delete from inventory")?;
-
-        // Notify shell change
-        notify_shell_change(&self.local_path, SHCNE_DELETE)
-            .context("failed to notify shell change")?;
 
         Ok(())
     }
@@ -123,120 +96,32 @@ impl CrPlaceholder {
 
         let file_meta = self.file_meta.as_ref().unwrap();
 
-        if self.local_file_info.exists {
-            if !self.local_file_info.is_placeholder() {
-                let primary_entity = OsString::from(file_meta.etag.clone());
-                let blob = primary_entity.into_encoded_bytes();
-                // Upgrade to placeholder
-                let mut local_handle = match self.local_file_info.is_directory {
-                    true => OpenOptions::new()
-                        .open(&self.local_path)
-                        .context("failed to open local directory")?,
-                    false => OpenOptions::new()
-                        .open_win32(&self.local_path)
-                        .context("failed to open local file")?,
-                };
-                tracing::info!(
-                    target: "drive::placeholder",
-                    local_path = %self.local_path.display(),
-                    "Converting to placeholder"
-                );
-                local_handle
-                    .convert_to_placeholder(
-                        ConvertOptions::default().mark_in_sync().blob(blob),
-                        None,
-                    )
-                    .context("failed to convert to placeholder")?;
-            }
+        let identity_blob = OsString::from(file_meta.etag.clone()).into_encoded_bytes();
+        let spec = VirtualPlaceholderSpec {
+            target_path: self.local_path.clone(),
+            sync_root: self.sync_root.clone(),
+            is_directory: file_meta.is_folder,
+            metadata: VirtualFileMetadata {
+                size: file_meta.size as u64,
+                created_unix: file_meta.created_at,
+                modified_unix: file_meta.updated_at,
+            },
+            identity_blob,
+            mark_in_sync: true,
+            overwrite: true,
+            dehydrate_on_update: self.options & CrPlaceholderOptions::InvalidateAllRange as u32 != 0,
+            has_no_children: self.options & CrPlaceholderOptions::MarkNoChildren as u32 != 0,
+        };
 
-            // Update file metadata
-            let mut upload_options = UpdateOptions::default().mark_in_sync().metadata(
-                Metadata::default()
-                    .size(file_meta.size as u64)
-                    .changed(FileTime::from_unix_time(file_meta.updated_at)?)
-                    .written(FileTime::from_unix_time(file_meta.updated_at)?)
-                    .created(FileTime::from_unix_time(file_meta.created_at)?),
-            );
-
-            let dehydrate_requested =
-                self.options & CrPlaceholderOptions::InvalidateAllRange as u32 != 0;
-            let mut local_handle = if dehydrate_requested {
-                OpenOptions::new()
-                    .write_access()
-                    .exclusive()
-                    .open(&self.local_path)
-                    .context("failed to open local placeholder for dehydration")?
-            } else {
-                match self.local_file_info.is_directory {
-                    true => OpenOptions::new()
-                        .open(&self.local_path)
-                        .context("failed to open local placeholder directory")?,
-                    false => OpenOptions::new()
-                        .open_win32(&self.local_path)
-                        .context("failed to open local placeholder file")?,
-                }
-            };
-            if dehydrate_requested {
-                tracing::debug!(target: "drive::placeholder", local_path = %self.local_path.display(), "Invalidating all range");
-                upload_options = upload_options.dehydrate();
-            }
-            if self.options & CrPlaceholderOptions::MarkNoChildren as u32 != 0 {
-                tracing::debug!(target: "drive::placeholder", local_path = %self.local_path.display(), "Marking no children");
-                upload_options = upload_options.has_no_children();
-            }
-            local_handle
-                .update(upload_options, None)
-                .context("failed to invalidate all range")?;
-        } else {
-            // Create placeholder file/directory
-            let relative_path = self
-                .local_path
-                .strip_prefix(&self.sync_root)
-                .context("failed to get relative path")?;
-            tracing::trace!(target: "drive::placeholder", relative_path = %relative_path.to_string_lossy(), "Relative path");
-            let primary_entity = OsString::from(file_meta.etag.clone());
-            let placeholder = PlaceholderFile::new(
-                self.local_path
-                    .file_name()
-                    .context("failed to get file name")?,
-            )
-            .metadata(
-                match file_meta.is_folder {
-                    true => Metadata::directory(),
-                    false => Metadata::file(),
-                }
-                .size(file_meta.size as u64)
-                .changed(FileTime::from_unix_time(file_meta.updated_at)?)
-                .written(FileTime::from_unix_time(file_meta.updated_at)?)
-                .created(FileTime::from_unix_time(file_meta.created_at)?),
-            )
-            .mark_in_sync()
-            .overwrite()
-            .blob(primary_entity.into_encoded_bytes());
-            let parent_path: &std::path::Path = self
-                .local_path
-                .parent()
-                .ok_or(anyhow::anyhow!("failed to get parent path"))?;
-            placeholder
-                .create::<&std::path::Path>(parent_path)
-                .context("failed to create placeholder")?;
-        }
+        platform_provider()?
+            .virtual_file_ops()
+            .upsert_placeholder(&spec)
+            .context("failed to upsert placeholder")?;
 
         // Upser inventory
         inventory
             .upsert(&MetadataEntry::from(file_meta))
             .context("failed to upsert inventory")?;
-
-        // Notify shell change
-        notify_shell_change(
-            &self.local_path,
-            if file_meta.is_folder {
-                SHCNE_CREATE
-            } else {
-                SHCNE_MKDIR
-            },
-        )
-        .context("failed to notify shell change")?;
 
         Ok(())
     }
@@ -253,6 +138,12 @@ impl CrPlaceholder {
             .map(|dt| dt.timestamp())
             .unwrap_or_default();
 
+        let mut metadata = file_info.metadata.clone().unwrap_or_default();
+        metadata.insert(
+            crate::drive::utils::INVENTORY_REMOTE_URI_KEY.to_string(),
+            file_info.path.clone(),
+        );
+
         self.file_meta = Some(FileMetadata {
             drive_id: self.drive_id,
             local_path: self.local_path.to_string_lossy().to_string(),
@@ -262,7 +153,7 @@ impl CrPlaceholder {
             size: file_info.size,
             etag: file_info.primary_entity.clone().unwrap_or_default(),
             id: 0,
-            metadata: file_info.metadata.clone().unwrap_or_default(),
+            metadata,
             props: None,
             permissions: file_info.permission.clone().unwrap_or_default(),
             shared: file_info.shared.unwrap_or(false),
@@ -271,10 +162,9 @@ impl CrPlaceholder {
         self
     }
 
-    /// Updates the sync error state for a file or folder in Windows Explorer.
+    /// Updates the platform-reported sync error state for a file or folder.
     ///
-    /// This function sets or clears the `PKEY_LastSyncError` shell property,
-    /// which controls the sync error overlay icon displayed in Explorer.
+    /// The concrete effect depends on the active platform virtual file implementation.
     ///
     /// # Arguments
     ///
@@ -284,56 +174,20 @@ impl CrPlaceholder {
     ///
     /// # Example
     ///
-    /// ```no_run
-    /// use std::path::Path;
-    ///
-    /// // Set error state on a file
-    /// update_sync_error_state(Path::new("C:\\MyFolder\\file.txt"), true)?;
-    ///
-    /// // Clear error state
-    /// update_sync_error_state(Path::new("C:\\MyFolder\\file.txt"), false)?;
+    /// ```ignore
+    /// // On a virtual placeholder handle:
+    /// placeholder.update_sync_error_state(true)?;
+    /// placeholder.update_sync_error_state(false)?;
     /// ```
     pub fn update_sync_error_state(&self, set_error: bool) -> Result<()> {
-        if !self.local_file_info.is_placeholder() {
+        if !self.local_file_info.is_virtual_placeholder() {
             // Skip non-placeholder file
             return Ok(());
         }
-        let path_wide = U16CString::from_os_str(&self.local_path)
-            .context("failed to convert path to wide string")?;
-
-        unsafe {
-            // Create a Shell Item from the file path
-            let item: IShellItem2 = SHCreateItemFromParsingName(PCWSTR(path_wide.as_ptr()), None)
-                .context("failed to create shell item from path")?;
-
-            // Get the Property Store with read/write access for extrinsic properties
-            let flags = GPS_READWRITE | GPS_EXTRINSICPROPERTIESONLY;
-            let property_store: IPropertyStore = item
-                .GetPropertyStore(flags)
-                .context("failed to get property store")?;
-
-            // Prepare the PROPVARIANT to set or clear the error state
-            let prop_var = if set_error {
-                // Set error state: VT_UI4 with E_FAIL value
-                let mut pv = PROPVARIANT::default().as_raw().clone();
-                pv.Anonymous.Anonymous.vt = VT_UI4.0;
-                pv.Anonymous.Anonymous.Anonymous.ulVal = E_FAIL.0 as u32;
-                PROPVARIANT::from_raw(pv)
-            } else {
-                let pv = PROPVARIANT::default().as_raw().clone();
-                PROPVARIANT::from_raw(pv)
-            };
-
-            // Set the PKEY_LastSyncError property
-            property_store
-                .SetValue(&PKEY_LastSyncError, &prop_var)
-                .context("failed to set PKEY_LastSyncError value")?;
-
-            // Commit the changes
-            property_store
-                .Commit()
-                .context("failed to commit property store changes")?;
-        }
+        platform_provider()?
+            .virtual_file_ops()
+            .set_sync_error(&self.local_path, set_error)
+            .context("failed to update sync error state")?;
 
         tracing::debug!(
             target: "drive::placeholder",

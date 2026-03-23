@@ -82,7 +82,6 @@ const STREAM_BUFFER_SIZE: usize = 64 * 1024;
 /// optionally applying encryption on-the-fly.
 pub struct ChunkReader {
     reader: BufReader<File>,
-    // handle: ArcWin32Handle,
     // placeholder: Placeholder,
     encryption: Option<EncryptionConfig>,
     start_offset: u64,

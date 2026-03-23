@@ -1,5 +1,7 @@
 use anyhow::Context;
-use cloudreve_sync::{ConfigManager, DriveManager, EventBroadcaster, LogConfig, LogGuard, shellext::shell_service::ServiceHandle};
+use cloudreve_app_config::ConfigManager;
+use cloudreve_platforms_api::PlatformProvider;
+use cloudreve_sync::{DriveManager, EventBroadcaster, LogConfig, LogGuard};
 use std::sync::{Arc, Mutex};
 use tauri::{
     async_runtime::spawn,
@@ -13,6 +15,8 @@ use tokio::sync::OnceCell;
 use crate::commands::{show_add_drive_window_impl, show_main_window, show_settings_window_impl};
 mod commands;
 mod event_handler;
+#[cfg(target_os = "windows")]
+mod windows_shell_host;
 
 #[macro_use]
 extern crate rust_i18n;
@@ -44,21 +48,52 @@ pub fn get_effective_locale() -> String {
 pub struct AppState {
     pub drive_manager: Arc<DriveManager>,
     pub event_broadcaster: Arc<EventBroadcaster>,
+    pub platform: Arc<dyn PlatformProvider>,
     // Keep the log guard alive for the entire application lifetime
     #[allow(dead_code)]
     log_guard: LogGuard,
     // Keep the shell service handle alive for the entire application lifetime
     #[allow(dead_code)]
-    shell_service: Mutex<ServiceHandle>,
+    shell_service: Mutex<ShellServiceHandle>,
 }
 
 /// Global cell to store the app state once initialization is complete
 static APP_STATE: OnceCell<AppState> = OnceCell::const_new();
 
+enum ShellServiceHandle {
+    #[cfg(target_os = "windows")]
+    Windows(cloudreve_platforms_windows::shellext::shell_service::ServiceHandle),
+    Other,
+}
+
+impl ShellServiceHandle {
+    fn wait_for_init(&mut self) -> anyhow::Result<()> {
+        match self {
+            #[cfg(target_os = "windows")]
+            Self::Windows(handle) => handle.wait_for_init().map_err(Into::into),
+            Self::Other => Ok(()),
+        }
+    }
+}
+
+fn create_platform_provider() -> Arc<dyn PlatformProvider> {
+    #[cfg(target_os = "windows")]
+    let provider: Arc<dyn PlatformProvider> =
+        Arc::new(cloudreve_platforms_windows::WindowsPlatformProvider::new());
+
+    #[cfg(not(target_os = "windows"))]
+    let provider: Arc<dyn PlatformProvider> =
+        Arc::new(cloudreve_platforms_macos::MacosPlatformProvider::new());
+
+    provider
+}
+
 /// Initialize the sync service (DriveManager, shell services, etc.)
 async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
-    // Initialize app root (Windows Package detection)
-    cloudreve_sync::init_app_root();
+    let platform = create_platform_provider();
+    #[cfg(target_os = "windows")]
+    cloudreve_platforms_windows::app::init_app_root();
+    let _ = cloudreve_sync::set_platform_provider(platform.clone());
 
     // Initialize logging system with config from ConfigManager
     let log_guard = cloudreve_sync::logging::init_logging(LogConfig::from_config_manager())
@@ -76,7 +111,8 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
     // Initialize DriveManager
     tracing::info!(target: "main", "Initializing DriveManager...");
     let drive_manager = Arc::new(
-        DriveManager::new(event_broadcaster.clone()).context("Failed to create DriveManager")?,
+        DriveManager::new_with_platform(event_broadcaster.clone(), platform.clone())
+            .context("Failed to create DriveManager")?,
     );
 
     // Spawn command processor for DriveManager
@@ -90,8 +126,19 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
         .context("Failed to load drive configurations")?;
 
     // Initialize and start the shell services (context menu handler) in a separate thread
-    let mut shell_service =
-        cloudreve_sync::shellext::shell_service::init_and_start_service_task(drive_manager.clone());
+    #[cfg(target_os = "windows")]
+    let mut shell_service = {
+        let shell_host = Arc::new(windows_shell_host::WindowsShellHost::new(
+            drive_manager.clone(),
+        ));
+        ShellServiceHandle::Windows(
+            cloudreve_platforms_windows::shellext::shell_service::init_and_start_service_task(
+                shell_host,
+            ),
+        )
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut shell_service = ShellServiceHandle::Other;
 
     // Wait for shell services to initialize
     if let Err(e) = shell_service.wait_for_init() {
@@ -108,6 +155,7 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
     let state = AppState {
         drive_manager,
         event_broadcaster: event_broadcaster.clone(),
+        platform,
         log_guard,
         shell_service: Mutex::new(shell_service),
     };
@@ -267,6 +315,11 @@ pub fn run() {
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_prevent_default::debug())
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            }
+
             #[cfg(desktop)]
             let _ = app.handle().plugin(tauri_plugin_positioner::init());
 
@@ -274,7 +327,13 @@ pub fn run() {
             setup_tray(app)?;
 
             #[cfg(desktop)]
-            app.deep_link().register("cloudreve")?;
+            if let Err(error) = app.deep_link().register("cloudreve") {
+                tracing::warn!(
+                    target: "main",
+                    error = ?error,
+                    "Deep link runtime registration is unavailable on this platform; continuing without it"
+                );
+            }
 
             // Spawn async setup task - this runs in the background
             // while the app continues to start
@@ -304,8 +363,10 @@ pub fn run() {
             commands::show_add_drive_window,
             commands::show_reauthorize_window,
             commands::show_settings_window,
+            commands::get_platform_capabilities,
             commands::get_auto_start_enabled,
             commands::set_auto_start,
+            commands::validate_local_sync_path,
             commands::set_notify_credential_expired,
             commands::set_notify_file_conflict,
             commands::set_fast_popup_launch,

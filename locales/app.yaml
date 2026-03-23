@@ -419,3 +419,36 @@ localPathCannotBeRootDrive:
   ru: "Локальный путь не может быть корневым диском (например, E:\\). Пожалуйста, выберите подпапку."
   pl: "Ścieżka lokalna nie może być dyskiem głównym (np. E:\\). Proszę wybrać podfolder."
   it: "Il percorso locale non può essere un'unità radice (es. E:\\). Seleziona una sottocartella."
+localPathEmpty:
+  en-US: "Please choose a local folder."
+  zh-CN: "请选择一个本地文件夹。"
+localPathMustBeAbsolute:
+  en-US: "The local path must be an absolute path."
+  zh-CN: "本地路径必须是绝对路径。"
+localPathParentMissing:
+  en-US: "The parent folder does not exist."
+  zh-CN: "上级目录不存在。"
+localPathPermissionDenied:
+  en-US: "Cloudreve does not have permission to write to this folder."
+  zh-CN: "Cloudreve 无权写入该文件夹。"
+localPathNotWritable:
+  en-US: "Cannot write to folder %{path}."
+  zh-CN: "无法写入文件夹 %{path}。"
+localPathMustBeDirectory:
+  en-US: "The local path must be a folder."
+  zh-CN: "本地路径必须是文件夹。"
+localPathAlreadyUsed:
+  en-US: "This folder is already used by drive %{name}."
+  zh-CN: "该文件夹已被网盘 %{name} 使用。"
+localPathOverlapsExistingDrive:
+  en-US: "This folder overlaps with drive %{name}."
+  zh-CN: "该文件夹与网盘 %{name} 的同步目录重叠。"
+localPathNotEmptyWarning:
+  en-US: "This folder is not empty. Existing files may be affected after sync starts."
+  zh-CN: "该文件夹不是空文件夹，开始同步后可能会影响现有文件。"
+openFolderPathEmpty:
+  en-US: "No path is available to open."
+  zh-CN: "没有可打开的路径。"
+openFolderFailed:
+  en-US: "Could not open folder for %{path}."
+  zh-CN: "无法为 %{path} 打开所在文件夹。"

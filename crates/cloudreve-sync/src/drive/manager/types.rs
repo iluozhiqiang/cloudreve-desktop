@@ -1,11 +1,39 @@
 use crate::drive::mounts::DriveConfig;
 use crate::inventory::TaskRecord;
 use crate::tasks::TaskProgress;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DriveState {
     pub drives: Vec<DriveConfig>,
+}
+
+impl DriveState {
+    /// Read `drives.json` from disk (same format as [`crate::drive::manager::DriveManager::load`]).
+    pub fn read_from_path(path: &Path) -> Result<Self> {
+        let content = fs::read_to_string(path).with_context(|| {
+            format!(
+                "Failed to read drive config file {}",
+                path.display()
+            )
+        })?;
+        serde_json::from_str(&content).context("Failed to parse drive config")
+    }
+
+    /// Write `drives.json` to disk (same formatting as [`crate::drive::manager::DriveManager::persist`]).
+    pub fn write_to_path(&self, path: &Path) -> Result<()> {
+        let content =
+            serde_json::to_string_pretty(self).context("Failed to serialize drive state")?;
+        fs::write(path, content).with_context(|| {
+            format!(
+                "Failed to write drive config file {}",
+                path.display()
+            )
+        })
+    }
 }
 
 /// Summary of the current status including drives and recent tasks
@@ -32,44 +60,30 @@ pub struct TaskWithProgress {
 /// Capacity summary for UI display
 #[derive(Debug, Clone, Serialize)]
 pub struct CapacitySummary {
-    /// Total capacity in bytes
     pub total: i64,
-    /// Used capacity in bytes
     pub used: i64,
-    /// Formatted label for display (e.g., "152.1 MB / 1.0 GB (14.9%)")
     pub label: String,
 }
 
 /// Sync status for UI display
 #[derive(Debug, Clone, Serialize)]
 pub enum SyncStatus {
-    /// All files are in sync
     InSync,
-    /// Currently syncing files
     Syncing,
-    /// Sync is paused
     Paused,
-    /// There was an error during sync
     Error,
 }
 
-/// Drive status information for the Windows Shell UI
+/// Drive status information for external desktop surfaces
 #[derive(Debug, Clone, Serialize)]
 pub struct DriveStatusUI {
-    /// Drive display name
     pub name: String,
-    /// Path to the raw (non-ICO) icon image
     pub raw_icon_path: Option<String>,
-    /// Capacity summary (None if not available)
     pub capacity: Option<CapacitySummary>,
-    /// URL to user profile page
     pub profile_url: String,
-    /// URL to settings page
     pub settings_url: String,
     pub storage_url: String,
-    /// Current sync status
     pub sync_status: SyncStatus,
-    /// Number of active (pending/running) tasks
     pub active_task_count: usize,
 }
 
@@ -130,5 +144,24 @@ pub fn format_bytes(bytes: i64) -> String {
         format!("{:.1} KB", bytes_f / KB)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+#[cfg(test)]
+mod format_bytes_tests {
+    use super::format_bytes;
+
+    #[test]
+    fn small_counts_as_bytes() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+    }
+
+    #[test]
+    fn kb_mb_gb_tb() {
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(format_bytes(1024_i64.pow(3)), "1.0 GB");
+        assert_eq!(format_bytes(1024_i64.pow(4)), "1.0 TB");
     }
 }

@@ -1,6 +1,8 @@
-use crate::{
-    cfapi::placeholder::LocalFileInfo,
-    drive::{commands::MountCommand, mounts::Mount, sync::SyncMode},
+use crate::drive::{
+    commands::MountCommand,
+    mounts::Mount,
+    sync::SyncMode,
+    utils::local_path_from_remote_file_event_field,
 };
 use anyhow::{Context, Result};
 use cloudreve_api::{
@@ -123,7 +125,10 @@ impl Mount {
                 Ok(Some(event)) => match event {
                     FileEvent::Event(events) => {
                         tracing::trace!(target: "drive::remote_events", events = ?events, "Handling file events batch");
-                        if let Err(e) = self.handle_file_events(sync_path.clone(), events).await {
+                        if let Err(e) = self
+                            .handle_file_events(sync_path.clone(), remote_base.clone(), events)
+                            .await
+                        {
                             tracing::error!(target: "drive::remote_events", error = ?e, "Failed to handle file events");
                         }
                     }
@@ -163,6 +168,7 @@ impl Mount {
     async fn handle_file_events(
         &self,
         sync_root: PathBuf,
+        remote_base: String,
         events: Vec<FileEventData>,
     ) -> Result<()> {
         // Group events by type
@@ -181,19 +187,23 @@ impl Mount {
 
         // Handle Create events grouped by parent
         if !create_update_events.is_empty() {
-            self.handle_create_update_events(sync_root.clone(), create_update_events)
-                .await?;
+            self.handle_create_update_events(
+                sync_root.clone(),
+                remote_base.clone(),
+                create_update_events,
+            )
+            .await?;
         }
 
         // Handle Delete events
         if !delete_events.is_empty() {
-            self.handle_delete_events(sync_root.clone(), delete_events)
+            self.handle_delete_events(sync_root.clone(), remote_base.clone(), delete_events)
                 .await?;
         }
 
         // Handle Rename events
         if !rename_events.is_empty() {
-            self.handle_rename_events(sync_root.clone(), rename_events)
+            self.handle_rename_events(sync_root.clone(), remote_base.clone(), rename_events)
                 .await?;
         }
 
@@ -203,6 +213,7 @@ impl Mount {
     async fn handle_rename_events(
         &self,
         sync_root: PathBuf,
+        remote_base: String,
         events: Vec<FileEventData>,
     ) -> Result<()> {
         // Handle rename as a combination of delete (from) and create (to)
@@ -212,10 +223,27 @@ impl Mount {
 
         for event in events {
             // Handle `from` path (like delete) - only if it exists locally
-            let from_relative: PathBuf = event.from.trim_start_matches('/').split('/').collect();
-            let local_from_path = sync_root.join(&from_relative);
+            let local_from_path = match local_path_from_remote_file_event_field(
+                &sync_root,
+                &remote_base,
+                &event.from,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "drive::remote_events",
+                        from = %event.from,
+                        error = %e,
+                        "Invalid remote rename from path, skipping"
+                    );
+                    continue;
+                }
+            };
 
-            let from_exists = match LocalFileInfo::from_path(&local_from_path) {
+            let from_exists = match crate::platform_provider()?
+                .virtual_file_ops()
+                .query_local_state(&local_from_path)
+            {
                 Ok(info) => info.exists,
                 Err(e) => {
                     tracing::trace!(
@@ -237,9 +265,26 @@ impl Mount {
                 }
             }
 
-            // Handle `to` path (like create) - always process
-            let to_relative: PathBuf = event.to.trim_start_matches('/').split('/').collect();
-            let local_to_path = sync_root.join(&to_relative);
+            // Handle `to` path (like create)
+            if event.to.trim().is_empty() {
+                continue;
+            }
+            let local_to_path = match local_path_from_remote_file_event_field(
+                &sync_root,
+                &remote_base,
+                &event.to,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "drive::remote_events",
+                        to = %event.to,
+                        error = %e,
+                        "Invalid remote rename to path, skipping"
+                    );
+                    continue;
+                }
+            };
 
             if let Some(parent) = local_to_path.parent() {
                 to_grouped_by_parent
@@ -252,7 +297,7 @@ impl Mount {
         // Process from paths (deletions)
         for (parent, paths) in from_grouped_by_parent {
             if let Err(e) = self
-                .sync_last_presented_parent(sync_root.clone(), parent, paths)
+                .sync_last_presented_parent(sync_root.clone(), parent, paths, None)
                 .await
             {
                 tracing::error!(
@@ -266,7 +311,7 @@ impl Mount {
         // Process to paths (creations)
         for (parent, paths) in to_grouped_by_parent {
             if let Err(e) = self
-                .sync_last_presented_parent(sync_root.clone(), parent, paths)
+                .sync_last_presented_parent(sync_root.clone(), parent, paths, None)
                 .await
             {
                 tracing::error!(
@@ -283,37 +328,39 @@ impl Mount {
     async fn handle_delete_events(
         &self,
         sync_root: PathBuf,
+        remote_base: String,
         events: Vec<FileEventData>,
     ) -> Result<()> {
-        // Group delete events by parent of `from` path, filtering out non-existent files
+        // Group delete events by parent of `from` path.
+        // We intentionally do not require the local path to exist:
+        // a parent resync is still needed to converge state when paths differ in encoding/casing.
         let mut grouped_by_parent: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
 
         for event in events {
-            // Remote paths use Unix-style separators, convert to OS-native path
-            let relative_path: PathBuf = event.from.trim_start_matches('/').split('/').collect();
-            let local_from_path = sync_root.join(&relative_path);
-
-            // Check if file exists locally, skip if not
-            let path_info = match LocalFileInfo::from_path(&local_from_path) {
-                Ok(info) => info,
+            let local_from_path = match local_path_from_remote_file_event_field(
+                &sync_root,
+                &remote_base,
+                &event.from,
+            ) {
+                Ok(p) => p,
                 Err(e) => {
-                    tracing::trace!(
+                    tracing::warn!(
                         target: "drive::remote_events",
-                        path = %local_from_path.display(),
-                        error = ?e,
-                        "Failed to get file info for delete event, skipping"
+                        from = %event.from,
+                        error = %e,
+                        "Invalid remote delete event path, skipping"
                     );
                     continue;
                 }
             };
 
-            if !path_info.exists {
-                tracing::trace!(
+            if tracing::enabled!(target: "drive::remote_events", tracing::Level::DEBUG) {
+                tracing::debug!(
                     target: "drive::remote_events",
-                    path = %local_from_path.display(),
-                    "File does not exist locally for delete event, skipping"
+                    remote_from = %event.from,
+                    local_from = %local_from_path.display(),
+                    "Mapped remote delete event -> local path"
                 );
-                continue;
             }
 
             if let Some(parent) = local_from_path.parent() {
@@ -326,8 +373,19 @@ impl Mount {
 
         // Process each group
         for (parent, paths) in grouped_by_parent {
+            tracing::debug!(
+                target: "drive::remote_events",
+                parent = %parent.display(),
+                path_count = paths.len(),
+                "Triggering sync due to remote delete events"
+            );
             if let Err(e) = self
-                .sync_last_presented_parent(sync_root.clone(), parent, paths)
+                .sync_last_presented_parent(
+                    sync_root.clone(),
+                    parent,
+                    paths,
+                    Some(SyncMode::RemoteDelete),
+                )
                 .await
             {
                 tracing::error!(
@@ -344,15 +402,29 @@ impl Mount {
     async fn handle_create_update_events(
         &self,
         sync_root: PathBuf,
+        remote_base: String,
         events: Vec<FileEventData>,
     ) -> Result<()> {
         // Group create events by parent of `from` path
         let mut grouped_by_parent: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
 
         for event in events {
-            // Remote paths use Unix-style separators, convert to OS-native path
-            let relative_path: PathBuf = event.from.trim_start_matches('/').split('/').collect();
-            let local_from_path = sync_root.join(&relative_path);
+            let local_from_path = match local_path_from_remote_file_event_field(
+                &sync_root,
+                &remote_base,
+                &event.from,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "drive::remote_events",
+                        from = %event.from,
+                        error = %e,
+                        "Invalid remote create/modify event path, skipping"
+                    );
+                    continue;
+                }
+            };
 
             if let Some(parent) = local_from_path.parent() {
                 grouped_by_parent
@@ -365,7 +437,7 @@ impl Mount {
         // Process each group
         for (parent, paths) in grouped_by_parent {
             if let Err(e) = self
-                .sync_last_presented_parent(sync_root.clone(), parent, paths)
+                .sync_last_presented_parent(sync_root.clone(), parent, paths, None)
                 .await
             {
                 tracing::error!(
@@ -384,6 +456,7 @@ impl Mount {
         sync_root: PathBuf,
         initial_parent: PathBuf,
         local_paths: Vec<PathBuf>,
+        preferred_mode: Option<SyncMode>,
     ) -> Result<()> {
         // Walk up from initial_parent to find the first existing & populated parent
         let mut current_path = initial_parent.clone();
@@ -403,13 +476,15 @@ impl Mount {
                 return Ok(());
             }
 
-            let path_info =
-                LocalFileInfo::from_path(&current_path).context("failed to get path file info")?;
+            let path_info = crate::platform_provider()?
+                .virtual_file_ops()
+                .query_local_state(&current_path)
+                .context("failed to get path file info")?;
 
             if path_info.exists {
-                if !path_info.is_placeholder() || path_info.is_folder_populated() {
+                if !path_info.is_virtual_placeholder() || path_info.has_materialized_children() {
                     // Found an existing & populated parent, sync from here
-                    let (mode, sync_paths) = if let Some(child_path) = child_of_existing {
+                    let (mut mode, mut sync_paths) = if let Some(child_path) = child_of_existing {
                         // We walked up, so sync the intermediate child folder
                         tracing::trace!(
                             target: "drive::remote_events",
@@ -437,6 +512,24 @@ impl Mount {
                         (SyncMode::PathOnly, local_paths.clone())
                     };
 
+                    if let Some(preferred_mode) = preferred_mode {
+                        mode = preferred_mode;
+                        if sync_paths.len() != local_paths.len() {
+                            sync_paths = local_paths.clone();
+                        }
+                    }
+
+                    if tracing::enabled!(target: "drive::remote_events", tracing::Level::DEBUG) {
+                        tracing::debug!(
+                            target: "drive::remote_events",
+                            sync_decision_parent = %current_path.display(),
+                            mode = ?mode,
+                            local_paths_count = local_paths.len(),
+                            sync_paths = ?sync_paths,
+                            "Selected sync range after remote file event"
+                        );
+                    }
+
                     self.command_tx
                         .send(MountCommand::Sync {
                             local_paths: sync_paths,
@@ -445,10 +538,13 @@ impl Mount {
                         .context("failed to send sync command")?;
                     return Ok(());
                 } else {
-                    tracing::trace!(
+                    tracing::debug!(
                         target: "drive::remote_events",
                         parent_path = %current_path.display(),
-                        "Parent path is a placeholder and not populated, skipping"
+                        is_virtual_placeholder = path_info.is_virtual_placeholder(),
+                        children_present = path_info.children_present,
+                        local_paths_count = local_paths.len(),
+                        "Parent path is a placeholder and not populated; skipping sync after remote delete/create"
                     );
                     return Ok(());
                 }
@@ -472,5 +568,30 @@ impl Mount {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::BackoffState;
+
+    #[test]
+    fn backoff_exponential_until_max_retries() {
+        let mut b = BackoffState::new();
+        assert_eq!(b.next_delay().unwrap().as_secs(), 1);
+        assert_eq!(b.next_delay().unwrap().as_secs(), 2);
+        assert_eq!(b.next_delay().unwrap().as_secs(), 4);
+        assert_eq!(b.next_delay().unwrap().as_secs(), 8);
+        assert_eq!(b.next_delay().unwrap().as_secs(), 16);
+        assert!(b.next_delay().is_none());
+    }
+
+    #[test]
+    fn backoff_reset_restores_sequence() {
+        let mut b = BackoffState::new();
+        let _ = b.next_delay();
+        let _ = b.next_delay();
+        b.reset();
+        assert_eq!(b.next_delay().unwrap().as_secs(), 1);
     }
 }

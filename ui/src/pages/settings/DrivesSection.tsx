@@ -1,9 +1,11 @@
 import {
+  Alert,
   Box,
   Card,
   CardContent,
   Typography,
   LinearProgress,
+  Snackbar,
   Stack,
   Tooltip,
   Link,
@@ -48,6 +50,7 @@ export default function DrivesSection() {
   const { t } = useTranslation();
   const [drives, setDrives] = useState<DriveInfo[]>([]);
   const [loading, setLoading] = useState(true);
+  const [uiError, setUiError] = useState("");
   const isFetchingRef = useRef(false);
 
   const fetchDrives = useCallback(async () => {
@@ -64,6 +67,7 @@ export default function DrivesSection() {
       );
     } catch (error) {
       console.error("Failed to fetch drives:", error);
+      setUiError(t("settings.loadDrivesFailed"));
     } finally {
       isFetchingRef.current = false;
       setLoading(false);
@@ -87,6 +91,7 @@ export default function DrivesSection() {
       await fetchDrives();
     } catch (error) {
       console.error("Failed to delete drive:", error);
+      setUiError(t("settings.deleteDriveFailed"));
     }
   };
 
@@ -99,6 +104,7 @@ export default function DrivesSection() {
       });
     } catch (error) {
       console.error("Failed to open reauthorize window:", error);
+      setUiError(t("settings.reauthorizeOpenFailed"));
     }
   };
 
@@ -107,6 +113,8 @@ export default function DrivesSection() {
       await invoke("show_file_in_explorer", { path });
     } catch (error) {
       console.error("Failed to open folder:", error);
+      const message = error instanceof Error ? error.message : String(error);
+      setUiError(message);
     }
   };
 
@@ -115,6 +123,7 @@ export default function DrivesSection() {
       await openUrl(url);
     } catch (error) {
       console.error("Failed to open site:", error);
+      setUiError(t("settings.openSiteFailed"));
     }
   };
 
@@ -123,6 +132,7 @@ export default function DrivesSection() {
       await invoke("show_add_drive_window");
     } catch (error) {
       console.error("Failed to open add drive window:", error);
+      setUiError(t("settings.openAddDriveFailed"));
     }
   };
 
@@ -383,6 +393,16 @@ export default function DrivesSection() {
       >
         {t("popup.newDrive")}
       </SecondaryButton>
+      <Snackbar
+        open={Boolean(uiError)}
+        autoHideDuration={3500}
+        onClose={() => setUiError("")}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      >
+        <Alert severity="error" onClose={() => setUiError("")} sx={{ width: "100%" }}>
+          {uiError}
+        </Alert>
+      </Snackbar>
     </Box>
   );
 }

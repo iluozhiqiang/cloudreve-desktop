@@ -1,18 +1,13 @@
 use crate::{
-    cfapi::{
-        filter::ticket,
-        placeholder::{LocalFileInfo, OpenOptions, PinState},
-        utility::WriteAt,
-    },
     drive::{
         mounts::Mount,
         placeholder::CrPlaceholder,
         sync::{GroupedFsEvents, SyncMode},
-        utils::{local_path_to_cr_uri, notify_shell_change},
+        utils::{cr_uri_for_fs_event_path, local_path_to_cr_uri, local_state_matches_inventory},
     },
     inventory::ConflictState,
+    platform_provider,
     tasks::TaskPayload,
-    utils::toast,
 };
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -32,14 +27,13 @@ use notify_debouncer_full::notify::{
     Event, EventKind,
     event::{CreateKind, ModifyKind, RemoveKind, RenameMode},
 };
+use cloudreve_platforms_api::{FetchDataRequest, LocalAvailability, VirtualFileMode};
 use std::{
     collections::HashMap,
-    ops::Range,
     path::{Path, PathBuf},
 };
 use tokio::sync::oneshot::Sender;
 use uuid::Uuid;
-use windows::Win32::UI::Shell::SHCNE_ATTRIBUTES;
 const PAGE_SIZE: i32 = 1000;
 
 /// Generate a unique filename by appending a counter suffix before the extension.
@@ -80,6 +74,11 @@ fn generate_unique_filename(original_path: &Path) -> PathBuf {
     }
 }
 
+fn is_duplicate_task_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.to_string().contains("Task already exists"))
+}
+
 #[derive(Debug, Clone)]
 pub struct GetPlacehodlerResult {
     pub files: Vec<FileResponse>,
@@ -87,12 +86,11 @@ pub struct GetPlacehodlerResult {
     pub remote_path: CrUri,
 }
 
-/// Messages sent from OS threads (SyncFilter callbacks) to the async processing task
+/// Messages sent from platform callback threads to the async processing task
 ///
 /// # Safety
-/// This is safe because Windows CFAPI callbacks are designed to be invoked from arbitrary threads
-/// and the data contained in Request, ticket, and info types are meant to be passed between threads
-/// during the callback's lifetime.
+/// This is safe because the platform callback bridge may invoke these handlers from arbitrary
+/// threads, and the contained request state is only forwarded for the duration of the callback.
 #[derive(Debug)]
 pub enum MountCommand {
     FetchPlaceholders {
@@ -105,9 +103,7 @@ pub enum MountCommand {
     /// Credential has become invalid (401, 40020, 40089 errors)
     CredentialInvalid,
     FetchData {
-        path: PathBuf,
-        ticket: ticket::FetchData,
-        range: Range<u64>,
+        request: FetchDataRequest,
         response: Sender<Result<()>>,
     },
     ProcessFsEvents {
@@ -128,9 +124,9 @@ pub enum MountCommand {
     },
 }
 
-// SAFETY: Windows CFAPI is designed to allow callbacks from arbitrary threads.
-// The Request, ticket, and info types contain data that is valid for the duration
-// of the callback and can be safely transferred between threads.
+// SAFETY: The platform callback bridge may invoke these handlers from arbitrary threads.
+// The request payload is only forwarded for the lifetime of the callback and can be
+// transferred across threads for async processing.
 unsafe impl Send for MountCommand {}
 
 /// Commands for the DriveManager
@@ -160,18 +156,18 @@ pub enum ManagerCommand {
     ShowConflictToast {
         path: PathBuf,
     },
-    /// Get drive status UI by sync root ID
+    /// Get drive status UI by mount identifier
     GetDriveStatusUI {
-        syncroot_id: String,
+        mount_id: String,
         response: Sender<Result<Option<crate::drive::manager::DriveStatusUI>>>,
     },
     /// Open user profile URL in browser
     OpenProfileUrl {
-        syncroot_id: String,
+        mount_id: String,
     },
     /// Open storage/capacity details URL in browser
     OpenStorageDetailsUrl {
-        syncroot_id: String,
+        mount_id: String,
     },
     /// Request to open the sync status window in the UI
     OpenSyncStatusWindow,
@@ -200,10 +196,11 @@ impl ConflictAction {
 impl Mount {
     pub async fn fetch_data(
         &self,
-        path: PathBuf,
-        ticket: ticket::FetchData,
-        range: Range<u64>,
+        request: FetchDataRequest,
     ) -> Result<()> {
+        let path = request.path.clone();
+        let range = request.range.clone();
+        let writer = request.writer.clone();
         let config = self.config.read().await;
         let remote_base = config.remote_path.clone();
         let sync_path = config.sync_path.clone();
@@ -217,16 +214,16 @@ impl Mount {
             .query_by_path(path.to_str().unwrap_or(""))
             .context("failed to query metadata by path")?;
 
-        let mut request: FileURLService = FileURLService::default();
-        request.uris.push(uri.to_string());
+        let mut file_url_request: FileURLService = FileURLService::default();
+        file_url_request.uris.push(uri.to_string());
         if let Some(meta) = file_meta {
             if !meta.etag.is_empty() {
-                request.entity = Some(meta.etag.clone());
+                file_url_request.entity = Some(meta.etag.clone());
             }
         }
         let entity_url_res = self
             .cr_client
-            .get_file_url(&request)
+            .get_file_url(&file_url_request)
             .await
             .context("failed to get file url")?;
 
@@ -243,7 +240,7 @@ impl Mount {
         // Calculate total bytes to fetch
         let total_bytes = range.end - range.start;
 
-        // 4KB chunk size (required by Windows CFAPI)
+        // Keep writes aligned to the platform callback writer's preferred block size.
         const CHUNK_SIZE: usize = 4096;
         // 64KB buffer for reading from network
         const BUFFER_SIZE: usize = 65536;
@@ -281,33 +278,25 @@ impl Mount {
                 let aligned_size = (accumulator.len() / CHUNK_SIZE) * CHUNK_SIZE;
                 let write_data = accumulator.drain(..aligned_size).collect::<Vec<u8>>();
 
-                ticket.write_at(&write_data, current_offset).map_err(|e| {
-                    anyhow::anyhow!("failed to write data at offset {}: {:?}", current_offset, e)
-                })?;
+                writer.write_at(&write_data, current_offset)?;
 
                 bytes_transferred += write_data.len() as u64;
                 current_offset += write_data.len() as u64;
 
-                // Report progress to Windows
-                ticket
-                    .report_progress(total_bytes, bytes_transferred)
-                    .map_err(|e| anyhow::anyhow!("failed to report progress: {:?}", e))?;
+                // Report progress back to the platform callback writer.
+                writer.report_progress(total_bytes, bytes_transferred)?;
             }
         }
 
         // Write any remaining data (last chunk, may be less than 4KB)
         if !accumulator.is_empty() {
-            ticket.write_at(&accumulator, current_offset).map_err(|e| {
-                anyhow::anyhow!("failed to write data at offset {}: {:?}", current_offset, e)
-            })?;
+            writer.write_at(&accumulator, current_offset)?;
 
             bytes_transferred += accumulator.len() as u64;
             // current_offset += accumulator.len() as u64;
 
             // Final progress report
-            ticket
-                .report_progress(total_bytes, bytes_transferred)
-                .map_err(|e| anyhow::anyhow!("failed to report progress: {:?}", e))?;
+            writer.report_progress(total_bytes, bytes_transferred)?;
         }
 
         tracing::debug!(
@@ -427,27 +416,10 @@ impl Mount {
         match self.task_queue.cancel_by_path(source.clone()).await {
             Ok(0) => {
                 // Mark file as in-sync
-                tracing::trace!(target: "drive::commands", path = %destination.display(), "Marking file as in-sync: OPEN");
-                match OpenOptions::new()
-                    .write_access()
-                    .exclusive()
-                    .open_with_retry(&destination)
-                    .await
-                {
-                    Ok(mut handle) => {
-                        tracing::trace!(target: "drive::commands", path = %destination.display(), "Marking file as in-sync");
-                        if let Err(e) = handle.mark_in_sync(true, None) {
-                            tracing::error!(target: "drive::commands", error = %e, "Failed to mark as in-sync");
-                            return Err(e.into());
-                        }
-                        tracing::trace!(target: "drive::commands", path = %destination.display(), "Marked file as in-sync: complete");
-                        Ok(())
-                    }
-                    Err(e) => {
-                        tracing::error!(target: "drive::commands", error = %e, "Failed to open file after retries");
-                        Err(e.into())
-                    }
-                }
+                tracing::trace!(target: "drive::commands", path = %destination.display(), "Marking file as in-sync");
+                crate::platform_provider()?
+                    .virtual_file_ops()
+                    .mark_in_sync(&destination, true)
             }
             Ok(count) => {
                 tracing::info!(target: "drive::commands", path = %source.display(), count = count, "Cancelled tasks");
@@ -597,7 +569,7 @@ impl Mount {
 
             if path_uri_mappings.is_empty() {
                 tracing::warn!(target: "drive::commands", "No valid URIs to process");
-                return Ok(());
+                continue;
             }
 
             match event_kind {
@@ -741,11 +713,15 @@ impl Mount {
                     tracing::error!(target: "drive::commands", error = %e, "Failed to send Sync command");
                 }
 
-                toast::send_general_text_toast(
+                if let Ok(platform) = platform_provider() {
+                    platform
+                    .desktop_integration()
+                    .send_general_text_notification(
                     &t!("conflictRenamed"),
                     &t!("newName","name" => new_path.
                 file_name().unwrap_or_default().to_string_lossy().to_string()),
-                );
+                    );
+                }
             }
         }
 
@@ -760,7 +736,10 @@ impl Mount {
                 continue;
             }
 
-            let to_file_info = match LocalFileInfo::from_path(event.paths[1].as_path()) {
+            let to_file_info = match crate::platform_provider()?
+                .virtual_file_ops()
+                .query_local_state(event.paths[1].as_path())
+            {
                 Ok(info) => info,
                 Err(e) => {
                     tracing::error!(target: "drive::commands", path = %event.paths[1].display(), error = %e, "Failed to get local file info");
@@ -768,14 +747,14 @@ impl Mount {
                 }
             };
 
-            if to_file_info.is_placeholder() {
+            if to_file_info.is_virtual_placeholder() {
                 tracing::debug!(target: "drive::commands", path = %event.paths[1].display(), "Skip for placeholder rename event");
                 continue;
             }
 
             // Cancel ongoing/pending tasks
             let result = self.task_queue.cancel_by_path(event.paths[0].clone()).await;
-            match (result, to_file_info.in_sync()) {
+            match (result, to_file_info.is_in_sync()) {
                 (Ok(0), true) => {
                     tracing::debug!(target: "drive::commands", path = %event.paths[0].display(), "No ongoing/pending tasks");
                 }
@@ -801,8 +780,8 @@ impl Mount {
     async fn process_fs_modify_events(
         &self,
         path_uri_mappings: HashMap<String, PathBuf>,
-        _sync_path: PathBuf,
-        _remote_base: String,
+        sync_path: PathBuf,
+        remote_base: String,
     ) -> Result<()> {
         tracing::debug!(
             target: "drive::commands",
@@ -811,59 +790,79 @@ impl Mount {
             "Processing filesystem modify events"
         );
 
-        for (_, path) in path_uri_mappings {
-            let placeholder_info = match LocalFileInfo::from_path(path.as_path()) {
+        let mut delete_mappings: HashMap<String, PathBuf> = HashMap::new();
+
+        for (uri, path) in path_uri_mappings {
+            let placeholder_info = match crate::platform_provider()?
+                .virtual_file_ops()
+                .query_local_state(path.as_path())
+            {
                 Ok(info) => info,
                 Err(e) => {
                     tracing::error!(target: "drive::commands", path = %path.display(), error = %e, "Failed to get local file info");
                     continue;
                 }
             };
+
+            // On macOS we may receive a modify event for a just-deleted file.
+            // Route these to the same local->remote delete flow used by remove events.
+            if !placeholder_info.exists {
+                tracing::debug!(
+                    target: "drive::commands",
+                    path = %path.display(),
+                    uri = %uri,
+                    "Modify event path no longer exists locally; routing to delete flow"
+                );
+                delete_mappings.insert(uri, path.clone());
+                continue;
+            }
             if placeholder_info.is_directory() {
                 continue;
             }
 
+            let real_file_mode = crate::platform_provider()
+                .map(|platform| platform.virtual_files().mode() == VirtualFileMode::None)
+                .unwrap_or(false);
+            let inventory_entry = path
+                .to_str()
+                .and_then(|path_str| self.inventory.query_by_path(path_str).ok().flatten());
+
+            if real_file_mode
+                && local_state_matches_inventory(&placeholder_info, inventory_entry.as_ref())
+            {
+                tracing::trace!(
+                    target: "drive::commands",
+                    path = %path.display(),
+                    "Skipping modify event because local file still matches inventory"
+                );
+                continue;
+            }
+
             // For pinned file but not on disk, hydrate it
-            let pin_state = placeholder_info.pinned();
-            if pin_state == PinState::Pinned && placeholder_info.partial_on_disk() {
+            let pin_state = placeholder_info.local_availability;
+            if !real_file_mode
+                && pin_state == LocalAvailability::AlwaysLocal
+                && placeholder_info.is_partially_on_disk()
+            {
                 tracing::debug!(target: "drive::commands", path = %path.display(), "Hydrate pinned not on disk placeholder");
-                let mut placeholder = match OpenOptions::new().open_win32(path.as_path()) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!(target: "drive::commands", path = %path.display(), error = %e, "Failed to open win32 file");
-                        continue;
-                    }
-                };
-                if let Err(e) = placeholder.hydrate(0..) {
+                if let Err(e) = crate::platform_provider()?
+                    .virtual_file_ops()
+                    .hydrate_file(&path, 0..u64::MAX)
+                {
                     tracing::error!(target: "drive::commands", path = %path.display(), error = %e, "Failed to hydrate placeholder");
                     continue;
                 }
                 tracing::trace!(target: "drive::commands", path = %path.display(), "Hydration complete");
-                _ = notify_shell_change(&path, SHCNE_ATTRIBUTES);
                 continue;
-            } else if pin_state == PinState::Unpinned {
+            } else if !real_file_mode && pin_state == LocalAvailability::OnlineOnly {
                 tracing::debug!(target: "drive::commands", path = %path.display(), "Dehydrate unpinned file");
 
-                let mut placeholder = match OpenOptions::new()
-                    .open_win32_with_retry(path.as_path())
-                    .await
+                match crate::platform_provider()?
+                    .virtual_file_ops()
+                    .dehydrate_file(&path, 0..u64::MAX)
                 {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!(
-                            target: "drive::commands",
-                            path = %path.display(),
-                            error = %e,
-                            "Failed to open win32 file for dehydration after retries"
-                        );
-                        continue;
-                    }
-                };
-
-                match placeholder.dehydrate(0..) {
                     Ok(_) => {
                         tracing::trace!(target: "drive::commands", path = %path.display(), "Dehydration complete");
-                        _ = notify_shell_change(&path, SHCNE_ATTRIBUTES);
                     }
                     Err(e) => {
                         tracing::error!(
@@ -878,7 +877,7 @@ impl Mount {
             }
 
             // General modification, quque a upload task if not exist
-            if !placeholder_info.in_sync() {
+            if real_file_mode || !placeholder_info.is_in_sync() {
                 tracing::debug!(target: "drive::commands", path = %path.display(), "Queuing upload task for modified file");
                 let payload = TaskPayload::upload(path.clone());
                 let result = self
@@ -886,12 +885,29 @@ impl Mount {
                     .enqueue(payload)
                     .await
                     .context("Failed to enqueue upload task");
-                if result.is_err() {
-                    tracing::error!(target: "drive::commands", path = %path.display(), error = ?result, "Failed to enqueue upload task");
-                    continue;
+                if let Err(err) = result {
+                    if is_duplicate_task_error(&err) {
+                        tracing::trace!(
+                            target: "drive::commands",
+                            path = %path.display(),
+                            "Upload task already queued for modified file"
+                        );
+                    } else {
+                        tracing::error!(target: "drive::commands", path = %path.display(), error = ?err, "Failed to enqueue upload task");
+                    }
                 }
                 continue;
             }
+        }
+
+        if !delete_mappings.is_empty() {
+            tracing::debug!(
+                target: "drive::commands",
+                count = delete_mappings.len(),
+                "Processing routed deletions from modify events"
+            );
+            self.process_fs_delete_events(delete_mappings, sync_path, remote_base)
+                .await?;
         }
 
         Ok(())
@@ -911,12 +927,49 @@ impl Mount {
         );
 
         for (_remote_uri, path) in path_uri_mappings {
-            let payload = TaskPayload::upload(path.clone());
+            let real_file_mode = crate::platform_provider()
+                .map(|platform| platform.virtual_files().mode() == VirtualFileMode::None)
+                .unwrap_or(false);
 
-            self.task_queue
-                .enqueue(payload)
-                .await
-                .context("Failed to enqueue upload task")?;
+            if real_file_mode {
+                let local_info = match crate::platform_provider()?
+                    .virtual_file_ops()
+                    .query_local_state(path.as_path())
+                {
+                    Ok(info) => info,
+                    Err(e) => {
+                        tracing::error!(target: "drive::commands", path = %path.display(), error = %e, "Failed to get local file info");
+                        continue;
+                    }
+                };
+                let inventory_entry = path
+                    .to_str()
+                    .and_then(|path_str| self.inventory.query_by_path(path_str).ok().flatten());
+
+                if local_state_matches_inventory(&local_info, inventory_entry.as_ref()) {
+                    tracing::trace!(
+                        target: "drive::commands",
+                        path = %path.display(),
+                        "Skipping create event because local file still matches inventory"
+                    );
+                    continue;
+                }
+            }
+
+            let payload = TaskPayload::upload(path.clone());
+            match self.task_queue.enqueue(payload).await {
+                Ok(_) => {}
+                Err(err) if is_duplicate_task_error(&err) => {
+                    tracing::trace!(
+                        target: "drive::commands",
+                        path = %path.display(),
+                        "Upload task already queued for created path"
+                    );
+                }
+                Err(err) => {
+                    return Err(err).context("Failed to enqueue upload task");
+                }
+            }
         }
 
         Ok(())
@@ -933,14 +986,19 @@ impl Mount {
     async fn process_fs_delete_events(
         &self,
         path_uri_mappings: HashMap<String, PathBuf>,
-        _sync_path: PathBuf,
-        _remote_base: String,
+        sync_path: PathBuf,
+        remote_base: String,
     ) -> Result<()> {
+        let mut uri_preview: Vec<String> = path_uri_mappings.keys().cloned().take(10).collect();
+        uri_preview.sort();
+
         tracing::debug!(
             target: "drive::commands",
+            sync_root = %sync_path.display(),
+            remote_base = %remote_base,
             uri_count = path_uri_mappings.len(),
-            uris = ?path_uri_mappings,
-            "Processing filesystem delete events"
+            uri_preview = ?uri_preview,
+            "Processing filesystem delete events (local -> remote)"
         );
 
         let uris: Vec<String> = path_uri_mappings.keys().cloned().collect();
@@ -998,8 +1056,19 @@ impl Mount {
 
         if !successful_paths.is_empty() {
             // Update local inventory to reflect successful deletions
+            let successful_preview: Vec<String> = successful_paths
+                .iter()
+                .filter_map(|p| p.to_str().map(|s| s.to_string()))
+                .take(10)
+                .collect();
             self.update_inventory_for_deletions(&successful_paths)
                 .context("Failed to update local inventory after deletions")?;
+            tracing::debug!(
+                target: "drive::commands",
+                success_count = successful_paths.len(),
+                success_preview = ?successful_preview,
+                "Updated inventory after local->remote deletions"
+            );
         }
 
         Ok(())
@@ -1017,10 +1086,11 @@ impl Mount {
             .iter()
             .flat_map(|event| &event.paths)
             .filter_map(|path| {
-                match local_path_to_cr_uri(
+                match cr_uri_for_fs_event_path(
                     path.clone(),
                     sync_path.to_path_buf(),
                     remote_base.to_string(),
+                    self.inventory.as_ref(),
                 ) {
                     Ok(uri) => Some((uri.to_string(), path.clone())),
                     Err(e) => {

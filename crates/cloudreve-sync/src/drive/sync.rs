@@ -1,19 +1,19 @@
 use crate::{
-    cfapi::{
-        metadata::Metadata,
-        placeholder::{LocalFileInfo, PinState},
-        placeholder_file::PlaceholderFile,
-    },
     drive::{
         mounts::Mount,
         placeholder::CrPlaceholder,
-        utils::{local_path_to_cr_uri, remote_path_to_local_relative_path},
+        utils::{
+            local_path_to_cr_uri, local_state_matches_inventory, remote_path_to_local_relative_path,
+        },
     },
     inventory::{ConflictState, FileMetadata, MetadataEntry},
     tasks::TaskPayload,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use cloudreve_platforms_api::{
+    LocalAvailability, PlaceholderEntry, VirtualFileMode, VirtualFileState,
+};
 use cloudreve_api::{
     ApiError,
     api::explorer::ExplorerApiExt,
@@ -27,7 +27,6 @@ use notify_debouncer_full::notify::event::{
     AccessKind, CreateKind, EventKind, ModifyKind, RemoveKind, RenameMode,
 };
 use notify_debouncer_full::{DebouncedEvent, notify::Event};
-use nt_time::FileTime;
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
@@ -38,39 +37,26 @@ use std::{
 use tokio::task;
 use uuid::Uuid;
 
-pub fn cloud_file_to_placeholder(
+pub fn cloud_file_to_placeholder_entry(
     file: &FileResponse,
-    _local_path: &PathBuf,
     remote_path: &CrUri,
-) -> Result<PlaceholderFile> {
+) -> Result<PlaceholderEntry> {
     let file_uri = CrUri::new(&file.path)?;
     let relative_path = remote_path_to_local_relative_path(&file_uri, &remote_path)?;
-    tracing::trace!(target: "drive::sync", file_uri = %file_uri.to_string(), remote_path = %remote_path.to_string(), relative_path = %relative_path.to_string_lossy(), "Relative path");
+    let created_unix = file.created_at.parse::<DateTime<Utc>>()?.timestamp();
+    let modified_unix = file.updated_at.parse::<DateTime<Utc>>()?.timestamp();
     let primary_entity = OsString::from(file.primary_entity.as_ref().unwrap_or(&String::new()));
-    // Remove leading slash if presented
 
-    // Parse RFC time string to unix timestamp
-    let created_at =
-        FileTime::from_unix_time(file.created_at.parse::<DateTime<Utc>>()?.timestamp())?;
-    let last_modified =
-        FileTime::from_unix_time(file.updated_at.parse::<DateTime<Utc>>()?.timestamp())?;
-
-    tracing::trace!(target: "drive::sync::cloud_file_to_placeholder", relative_path = %relative_path.to_string_lossy(), "Relative path");
-
-    Ok(PlaceholderFile::new(relative_path)
-        .metadata(
-            match file.file_type == file_type::FOLDER {
-                true => Metadata::directory(),
-                false => Metadata::file(),
-            }
-            .size(file.size as u64)
-            .changed(last_modified)
-            .written(last_modified)
-            .created(created_at),
-        )
-        .mark_in_sync()
-        .overwrite()
-        .blob(primary_entity.into_encoded_bytes()))
+    Ok(PlaceholderEntry {
+        relative_path,
+        is_directory: file.file_type == file_type::FOLDER,
+        size: file.size as u64,
+        created_unix,
+        modified_unix,
+        blob: primary_entity.into_encoded_bytes(),
+        mark_in_sync: true,
+        overwrite: true,
+    })
 }
 
 pub fn cloud_file_to_metadata_entry(
@@ -94,6 +80,12 @@ pub fn cloud_file_to_metadata_entry(
     let created_at = file.created_at.parse::<DateTime<Utc>>()?.timestamp();
     let last_modified = file.updated_at.parse::<DateTime<Utc>>()?.timestamp();
 
+    let mut metadata = file.metadata.clone().unwrap_or_default();
+    metadata.insert(
+        crate::drive::utils::INVENTORY_REMOTE_URI_KEY.to_string(),
+        file.path.clone(),
+    );
+
     Ok(MetadataEntry::new(
         drive_id.clone(),
         local_path_str.unwrap(),
@@ -110,7 +102,7 @@ pub fn cloud_file_to_metadata_entry(
             .unwrap_or(&String::new())
             .clone(),
     )
-    .with_metadata(file.metadata.as_ref().unwrap_or(&HashMap::new()).clone()))
+    .with_metadata(metadata))
 }
 
 pub fn is_symbolic_link(file: &FileResponse) -> bool {
@@ -184,6 +176,8 @@ fn normalize_event_kind(kind: &EventKind) -> EventKind {
 pub enum SyncMode {
     /// Sync only the provided path entries.
     PathOnly,
+    /// Sync paths with remote-delete intent (prefer deleting local when remote is missing).
+    RemoteDelete,
     /// Sync the provided path entries and their first-level children.
     PathAndFirstLayer,
     /// Sync the provided path entries and every descendant.
@@ -382,6 +376,7 @@ fn next_child_mode(mode: SyncMode) -> SyncMode {
     match mode {
         SyncMode::FullHierarchy => SyncMode::FullHierarchy,
         SyncMode::PathAndFirstLayer => SyncMode::PathOnly,
+        SyncMode::RemoteDelete => SyncMode::PathOnly,
         SyncMode::PathOnly => SyncMode::PathOnly,
     }
 }
@@ -477,7 +472,22 @@ impl Mount {
 
         let remote_files = match prefetched_remote_files {
             Some(files) => files,
-            None => self.fetch_remote_file_infos(parent, paths).await?,
+            None => {
+                // Remote delete intent should converge quickly without needing remote metadata.
+                // We can treat `remote` as missing so the planner will prefer DeleteLocalAndInventory.
+                if mode == SyncMode::RemoteDelete {
+                    tracing::debug!(
+                        target: "drive::sync",
+                        id = %self.id,
+                        parent = %parent.display(),
+                        requested = paths.len(),
+                        "Skipping remote metadata fetch for RemoteDelete"
+                    );
+                    HashMap::new()
+                } else {
+                    self.fetch_remote_file_infos(parent, paths).await?
+                }
+            }
         };
         tracing::debug!(
             target: "drive::sync",
@@ -562,6 +572,50 @@ impl Mount {
         Ok(())
     }
 
+    fn register_remote_materialization_blockers(&self, path: &Path, is_directory: bool) {
+        let is_real_file_mode = crate::platform_provider()
+            .map(|platform| platform.virtual_files().mode() == VirtualFileMode::None)
+            .unwrap_or(false);
+        let create_count = if is_real_file_mode { 2 } else { 1 };
+        self.event_blocker.register(
+            &EventKind::Create(CreateKind::Any),
+            path.to_path_buf(),
+            create_count,
+        );
+
+        if !is_directory {
+            let modify_count = if is_real_file_mode { 3 } else { 1 };
+            self.event_blocker.register(
+                &EventKind::Modify(ModifyKind::Any),
+                path.to_path_buf(),
+                modify_count,
+            );
+        }
+    }
+
+    async fn enqueue_download_task(
+        &self,
+        path: &PathBuf,
+        aggregate_error: &mut SyncAggregateError,
+    ) {
+        let _ = self.task_queue.cancel_by_path(path.clone()).await;
+
+        if let Err(err) = self
+            .task_queue
+            .enqueue(TaskPayload::download(path.clone()))
+            .await
+        {
+            tracing::error!(
+                target: "drive::sync",
+                id = %self.id,
+                path = %path.display(),
+                error = ?err,
+                "Failed to enqueue download task"
+            );
+            aggregate_error.push(path.clone(), anyhow::Error::from(err));
+        }
+    }
+
     async fn process_action(
         &self,
         action: &SyncAction,
@@ -571,6 +625,7 @@ impl Mount {
     ) {
         match action {
             SyncAction::CreatePlaceholderAndInventory { path, remote } => {
+                self.register_remote_materialization_blockers(path, remote.file_type == file_type::FOLDER);
                 let cr_placeholder =
                     CrPlaceholder::new(path.clone(), sync_root.clone(), drive_id.clone());
                 if let Err(err) = cr_placeholder
@@ -585,6 +640,15 @@ impl Mount {
                         "Failed to create placeholder and inventory"
                     );
                     aggregate_error.push(path.clone(), err);
+                    return;
+                }
+
+                if crate::platform_provider()
+                    .map(|platform| platform.virtual_files().mode() == VirtualFileMode::None)
+                    .unwrap_or(false)
+                    && remote.file_type != file_type::FOLDER
+                {
+                    self.enqueue_download_task(path, aggregate_error).await;
                 }
             }
             SyncAction::UpdateInventoryFromRemote {
@@ -592,6 +656,7 @@ impl Mount {
                 remote,
                 invalidate_all,
             } => {
+                self.register_remote_materialization_blockers(path, remote.file_type == file_type::FOLDER);
                 let cr_placeholder =
                     CrPlaceholder::new(path.clone(), sync_root.clone(), drive_id.clone());
                 if let Err(err) = cr_placeholder
@@ -607,6 +672,15 @@ impl Mount {
                         "Failed to update inventory from remote"
                     );
                     aggregate_error.push(path.clone(), err);
+                    return;
+                }
+
+                if crate::platform_provider()
+                    .map(|platform| platform.virtual_files().mode() == VirtualFileMode::None)
+                    .unwrap_or(false)
+                    && remote.file_type != file_type::FOLDER
+                {
+                    self.enqueue_download_task(path, aggregate_error).await;
                 }
             }
             SyncAction::QueueUpload { path, reason } => {
@@ -641,23 +715,8 @@ impl Mount {
                     "Queueing download task"
                 );
 
-                // Cancel ongoing tasks
-                let _ = self.task_queue.cancel_by_path(path.clone()).await;
-
-                if let Err(err) = self
-                    .task_queue
-                    .enqueue(TaskPayload::download(path.clone()))
-                    .await
-                {
-                    tracing::error!(
-                        target: "drive::sync",
-                        id = %self.id,
-                        path = %path.display(),
-                        error = ?err,
-                        "Failed to enqueue download task"
-                    );
-                    aggregate_error.push(path.clone(), anyhow::Error::from(err));
-                }
+                self.register_remote_materialization_blockers(path, false);
+                self.enqueue_download_task(path, aggregate_error).await;
             }
             SyncAction::DeleteLocalAndInventory {
                 path,
@@ -755,15 +814,16 @@ impl Mount {
     async fn fetch_local_file_infos(
         &self,
         paths: &[PathBuf],
-    ) -> Result<HashMap<PathBuf, LocalFileInfo>> {
+    ) -> Result<HashMap<PathBuf, VirtualFileState>> {
         if paths.is_empty() {
             return Ok(HashMap::new());
         }
 
         let targets: Vec<PathBuf> = paths.to_vec();
         let mut entries = HashMap::with_capacity(targets.len());
+        let platform = crate::platform_provider()?;
         for path in targets {
-            let info = LocalFileInfo::from_path(&path)?;
+            let info = platform.virtual_file_ops().query_local_state(&path)?;
             entries.insert(path, info);
         }
 
@@ -917,7 +977,7 @@ impl Mount {
         mode: SyncMode,
         paths: &[PathBuf],
         remote_files: &HashMap<PathBuf, FileResponse>,
-        local_files: &HashMap<PathBuf, LocalFileInfo>,
+        local_files: &HashMap<PathBuf, VirtualFileState>,
         inventory_entries: &HashMap<PathBuf, FileMetadata>,
     ) -> SyncPlan {
         let mut plan = SyncPlan::default();
@@ -926,7 +986,7 @@ impl Mount {
             let local_info = local_files
                 .get(path)
                 .cloned()
-                .unwrap_or_else(LocalFileInfo::missing);
+                .unwrap_or_else(VirtualFileState::missing);
             let remote = remote_files.get(path);
             let inventory = inventory_entries.get(path);
             self.plan_entry_actions(path, mode, remote, &local_info, inventory, &mut plan);
@@ -940,7 +1000,7 @@ impl Mount {
         path: &PathBuf,
         mode: SyncMode,
         remote: Option<&FileResponse>,
-        local: &LocalFileInfo,
+        local: &VirtualFileState,
         inventory: Option<&FileMetadata>,
         plan: &mut SyncPlan,
     ) {
@@ -972,14 +1032,14 @@ impl Mount {
         path: &PathBuf,
         mode: SyncMode,
         remote: &FileResponse,
-        local: &LocalFileInfo,
+        local: &VirtualFileState,
         inventory: Option<&FileMetadata>,
         plan: &mut SyncPlan,
     ) {
         let remote_is_dir = remote.file_type == file_type::FOLDER;
 
         if local.is_directory != remote_is_dir {
-            if local.is_placeholder() && local.partial_on_disk() {
+            if local.is_virtual_placeholder() && local.is_partially_on_disk() {
                 plan.actions.push(SyncAction::DeleteLocalAndInventory {
                     path: path.clone(),
                     skip_if_not_empty: false,
@@ -1035,7 +1095,7 @@ impl Mount {
         &self,
         path: &PathBuf,
         mode: SyncMode,
-        local: &LocalFileInfo,
+        local: &VirtualFileState,
         _inventory: Option<&FileMetadata>,
         plan: &mut SyncPlan,
     ) {
@@ -1043,8 +1103,17 @@ impl Mount {
             return;
         }
 
+        // Remote delete events should prefer removing local entries instead of re-uploading.
+        if mode == SyncMode::RemoteDelete {
+            plan.actions.push(SyncAction::DeleteLocalAndInventory {
+                path: path.clone(),
+                skip_if_not_empty: local.is_directory,
+            });
+            return;
+        }
+
         if local.is_directory {
-            let hydrated = local.is_folder_populated();
+            let hydrated = local.has_materialized_children();
             if !hydrated {
                 plan.actions.push(SyncAction::DeleteLocalAndInventory {
                     path: path.clone(),
@@ -1063,7 +1132,7 @@ impl Mount {
             return;
         }
 
-        if local.is_placeholder() && local.in_sync() {
+        if local.is_virtual_placeholder() && local.is_in_sync() {
             plan.actions.push(SyncAction::DeleteLocalAndInventory {
                 path: path.clone(),
                 skip_if_not_empty: false,
@@ -1082,11 +1151,31 @@ impl Mount {
         &self,
         path: &PathBuf,
         remote: &FileResponse,
-        local: &LocalFileInfo,
+        local: &VirtualFileState,
         inventory: Option<&FileMetadata>,
         plan: &mut SyncPlan,
     ) {
-        if !local.is_placeholder() || !local.in_sync() {
+        if crate::platform_provider()
+            .map(|platform| platform.virtual_files().mode() == VirtualFileMode::None)
+            .unwrap_or(false)
+        {
+            let conflicting =
+                inventory.is_some_and(|inv| inv.conflict_state == Some(ConflictState::Pending));
+            if !conflicting && local_state_matches_inventory(local, inventory) {
+                plan.actions.push(SyncAction::QueueDownload {
+                    path: path.clone(),
+                    remote: remote.clone(),
+                });
+            } else if !conflicting {
+                plan.actions.push(SyncAction::QueueUpload {
+                    path: path.clone(),
+                    reason: UploadReason::RemoteMismatch,
+                });
+            }
+            return;
+        }
+
+        if !local.is_virtual_placeholder() || !local.is_in_sync() {
             let conflicting =
                 inventory.is_some_and(|inv| inv.conflict_state == Some(ConflictState::Pending));
             if !conflicting {
@@ -1098,8 +1187,8 @@ impl Mount {
             return;
         }
 
-        let pinned = local.pinned();
-        if pinned == PinState::Pinned {
+        let pinned = local.local_availability;
+        if pinned == LocalAvailability::AlwaysLocal {
             plan.actions.push(SyncAction::QueueDownload {
                 path: path.clone(),
                 remote: remote.clone(),
@@ -1108,7 +1197,7 @@ impl Mount {
             plan.actions.push(SyncAction::UpdateInventoryFromRemote {
                 path: path.clone(),
                 remote: remote.clone(),
-                invalidate_all: !local.partial_on_disk(),
+                invalidate_all: !local.is_partially_on_disk(),
             });
         }
     }
@@ -1117,7 +1206,7 @@ impl Mount {
         &self,
         path: &PathBuf,
         parent_mode: SyncMode,
-        local: &LocalFileInfo,
+        local: &VirtualFileState,
         force_diff: bool,
         immediate: bool,
         plan: &mut SyncPlan,
@@ -1135,7 +1224,7 @@ impl Mount {
         if matches!(
             parent_mode,
             SyncMode::FullHierarchy | SyncMode::PathAndFirstLayer
-        ) && (local.is_folder_populated() || !local.is_placeholder())
+        ) && (local.has_materialized_children() || !local.is_virtual_placeholder())
         {
             let mode = next_child_mode(parent_mode);
             self.insert_walk_request(

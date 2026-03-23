@@ -35,6 +35,13 @@
     },
     "withGlobalTauri": true
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["cloudreve"]
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": [],

@@ -1,7 +1,7 @@
 use super::DriveManager;
 use crate::drive::commands::{ManagerCommand, MountCommand};
 use crate::drive::utils::{local_path_to_cr_uri, view_online_url};
-use crate::utils::toast::send_conflict_toast;
+use crate::platform_provider;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -118,25 +118,25 @@ impl DriveManager {
                         }
                     });
                 }
-                ManagerCommand::GetDriveStatusUI { syncroot_id, response } => {
+                ManagerCommand::GetDriveStatusUI { mount_id, response } => {
                     spawn(async move {
-                        let result = manager.get_drive_status_by_syncroot_id(&syncroot_id).await;
+                        let result = manager.get_drive_status_by_mount_id(&mount_id).await;
                         let _ = response.send(result);
                     });
                 }
-                ManagerCommand::OpenProfileUrl { syncroot_id } => {
+                ManagerCommand::OpenProfileUrl { mount_id } => {
                     spawn(async move {
-                        let result = manager.handle_open_profile_url(&syncroot_id).await;
+                        let result = manager.handle_open_profile_url(&mount_id).await;
                         if let Err(e) = result {
-                            tracing::error!(target: "drive::manager", syncroot_id = %syncroot_id, error = %e, "Failed to open profile URL");
+                            tracing::error!(target: "drive::manager", mount_id = %mount_id, error = %e, "Failed to open profile URL");
                         }
                     });
                 }
-                ManagerCommand::OpenStorageDetailsUrl { syncroot_id } => {
+                ManagerCommand::OpenStorageDetailsUrl { mount_id } => {
                     spawn(async move {
-                        let result = manager.handle_open_storage_details_url(&syncroot_id).await;
+                        let result = manager.handle_open_storage_details_url(&mount_id).await;
                         if let Err(e) = result {
-                            tracing::error!(target: "drive::manager", syncroot_id = %syncroot_id, error = %e, "Failed to open storage details URL");
+                            tracing::error!(target: "drive::manager", mount_id = %mount_id, error = %e, "Failed to open storage details URL");
                         }
                     });
                 }
@@ -210,32 +210,36 @@ impl DriveManager {
         let config = mount.get_config().await;
 
         // Send the conflict toast
-        send_conflict_toast(&config.id, &path, file_meta.id);
+        if let Ok(platform) = platform_provider() {
+            platform
+                .desktop_integration()
+                .send_conflict_notification(&config.id, &path, file_meta.id);
+        }
 
         Ok(())
     }
 
     /// Handle OpenProfileUrl command - opens user profile page in browser
-    pub(super) async fn handle_open_profile_url(&self, syncroot_id: &str) -> Result<()> {
-        tracing::debug!(target: "drive::manager", syncroot_id = %syncroot_id, "OpenProfileUrl command");
+    pub(super) async fn handle_open_profile_url(&self, mount_id: &str) -> Result<()> {
+        tracing::debug!(target: "drive::manager", mount_id = %mount_id, "OpenProfileUrl command");
 
         let status = self
-            .get_drive_status_by_syncroot_id(syncroot_id)
+            .get_drive_status_by_mount_id(mount_id)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("No drive found for syncroot_id: {}", syncroot_id))?;
+            .ok_or_else(|| anyhow::anyhow!("No drive found for mount_id: {}", mount_id))?;
 
         open::that(&status.profile_url)?;
         Ok(())
     }
 
     /// Handle OpenStorageDetailsUrl command - opens storage/capacity page in browser
-    pub(super) async fn handle_open_storage_details_url(&self, syncroot_id: &str) -> Result<()> {
-        tracing::debug!(target: "drive::manager", syncroot_id = %syncroot_id, "OpenStorageDetailsUrl command");
+    pub(super) async fn handle_open_storage_details_url(&self, mount_id: &str) -> Result<()> {
+        tracing::debug!(target: "drive::manager", mount_id = %mount_id, "OpenStorageDetailsUrl command");
 
         let status = self
-            .get_drive_status_by_syncroot_id(syncroot_id)
+            .get_drive_status_by_mount_id(mount_id)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("No drive found for syncroot_id: {}", syncroot_id))?;
+            .ok_or_else(|| anyhow::anyhow!("No drive found for mount_id: {}", mount_id))?;
 
         // Open the profile URL which shows storage details
         open::that(&status.storage_url)?;

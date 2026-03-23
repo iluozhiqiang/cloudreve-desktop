@@ -1,20 +1,20 @@
 use crate::AppStateHandle;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{Duration, Utc};
+use cloudreve_app_config::{ConfigManager, LogLevel};
 use cloudreve_sync::{
-    config::LogLevel, ConfigManager, Credentials, DriveConfig, DriveInfo, StatusSummary,
+    Credentials, DriveConfig, DriveInfo, PlatformCapabilities, StatusSummary,
 };
-#[cfg(target_os = "macos")]
-use tauri::TitleBarStyle;
+use std::fs::{self, OpenOptions};
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use tauri::{
     utils::{config::WindowEffectsConfig, WindowEffect},
     webview::WebviewWindowBuilder,
     AppHandle, Manager, State, WebviewUrl,
 };
-use tauri_plugin_frame::WebviewWindowExt;
 use tauri_plugin_positioner::{Position, WindowExt};
 use uuid::Uuid;
-use windows::ApplicationModel::{StartupTask, StartupTaskState};
 
 /// Result type for Tauri commands
 type CommandResult<T> = Result<T, String>;
@@ -43,6 +43,123 @@ fn get_url_with_lang(base_path: &str) -> String {
     } else {
         format!("{}?lng={}", base_path, locale)
     }
+}
+
+#[derive(serde::Serialize)]
+pub struct LocalPathValidation {
+    pub normalized_path: String,
+    pub warning: Option<String>,
+}
+
+fn normalize_local_path(path: &str) -> CommandResult<PathBuf> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(t!("localPathEmpty").to_string());
+    }
+
+    let normalized = PathBuf::from(trimmed);
+    if !normalized.is_absolute() {
+        return Err(t!("localPathMustBeAbsolute").to_string());
+    }
+
+    if is_root_drive(trimmed) {
+        return Err(t!("localPathCannotBeRootDrive").to_string());
+    }
+
+    Ok(normalized)
+}
+
+fn nearest_existing_parent(path: &Path) -> Option<PathBuf> {
+    let mut current = path.to_path_buf();
+    loop {
+        if current.exists() {
+            return Some(current);
+        }
+        current = current.parent()?.to_path_buf();
+    }
+}
+
+fn verify_path_writable(path: &Path) -> CommandResult<()> {
+    let probe_dir = if path.exists() {
+        path.to_path_buf()
+    } else {
+        nearest_existing_parent(path)
+            .ok_or_else(|| t!("localPathParentMissing").to_string())?
+    };
+
+    let probe_path = probe_dir.join(format!(".cloudreve-write-test-{}", Uuid::new_v4()));
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe_path)
+        .map_err(|e| {
+            if e.kind() == ErrorKind::PermissionDenied {
+                t!("localPathPermissionDenied").to_string()
+            } else {
+                t!("localPathNotWritable", path = probe_dir.display().to_string()).to_string()
+            }
+        })?;
+    let _ = fs::remove_file(&probe_path);
+    Ok(())
+}
+
+async fn validate_local_sync_path_impl(
+    state: &State<'_, AppStateHandle>,
+    path: &str,
+    drive_id: Option<&str>,
+) -> CommandResult<LocalPathValidation> {
+    let app_state = state
+        .get()
+        .ok_or_else(|| "App not yet initialized".to_string())?;
+    let normalized = normalize_local_path(path)?;
+
+    if normalized.exists() && !normalized.is_dir() {
+        return Err(t!("localPathMustBeDirectory").to_string());
+    }
+
+    let drives = app_state.drive_manager.list_drives().await;
+    for drive in drives {
+        if drive_id.is_some() && drive_id == Some(drive.id.as_str()) {
+            continue;
+        }
+
+        let existing = PathBuf::from(&drive.sync_path);
+        if normalized == existing {
+            return Err(t!("localPathAlreadyUsed", name = drive.name).to_string());
+        }
+
+        if normalized.starts_with(&existing) || existing.starts_with(&normalized) {
+            return Err(t!("localPathOverlapsExistingDrive", name = drive.name).to_string());
+        }
+    }
+
+    let warning = if normalized.exists() {
+        let is_empty = fs::read_dir(&normalized)
+            .map_err(|e| e.to_string())?
+            .next()
+            .is_none();
+        if !is_empty {
+            Some(t!("localPathNotEmptyWarning").to_string())
+        } else {
+            None
+        }
+    } else {
+        let parent = normalized
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| t!("localPathParentMissing").to_string())?;
+        if !parent.exists() {
+            return Err(t!("localPathParentMissing").to_string());
+        }
+        None
+    };
+
+    verify_path_writable(&normalized)?;
+
+    Ok(LocalPathValidation {
+        normalized_path: normalized.display().to_string(),
+        warning,
+    })
 }
 
 /// List all configured drives
@@ -79,8 +196,8 @@ pub async fn add_drive(
         .ok_or_else(|| "App not yet initialized".to_string())?;
 
     // Validate local_path for new drives (not for reauthorization)
-    if config.drive_id.is_none() && is_root_drive(&config.local_path) {
-        return Err(t!("localPathCannotBeRootDrive").to_string());
+    if config.drive_id.is_none() {
+        validate_local_sync_path_impl(&state, &config.local_path, None).await?;
     }
 
     // Convert relative expiry times (seconds) to absolute RFC3339 timestamps
@@ -134,7 +251,7 @@ pub async fn add_drive(
         raw_icon_path: None,
         enabled: true,
         user_id: config.user_id,
-        sync_root_id: None,
+        mount_id: None,
         ignore_patterns: Vec::new(),
         extra: Default::default(),
     };
@@ -154,6 +271,15 @@ pub async fn add_drive(
         .map_err(|e| e.to_string())?;
 
     Ok(id)
+}
+
+#[tauri::command]
+pub async fn validate_local_sync_path(
+    state: State<'_, AppStateHandle>,
+    path: String,
+    drive_id: Option<String>,
+) -> CommandResult<LocalPathValidation> {
+    validate_local_sync_path_impl(&state, &path, drive_id.as_deref()).await
 }
 
 /// Remove a drive by ID
@@ -321,9 +447,21 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
 /// Show a file in the system file explorer (Windows Explorer, Finder, etc.)
 /// This will open the parent folder and select/highlight the file.
 #[tauri::command]
-pub async fn show_file_in_explorer(path: String) -> CommandResult<()> {
-    showfile::show_path_in_file_manager(&path);
-    Ok(())
+pub async fn show_file_in_explorer(
+    state: State<'_, AppStateHandle>,
+    path: String,
+) -> CommandResult<()> {
+    if path.trim().is_empty() {
+        return Err(t!("openFolderPathEmpty").to_string());
+    }
+
+    state
+        .get()
+        .ok_or_else(|| "App not yet initialized".to_string())?
+        .platform
+        .desktop_integration()
+        .open_in_file_manager(Path::new(&path))
+        .map_err(|_| t!("openFolderFailed", path = path).to_string())
 }
 
 /// Command to show the add-drive window
@@ -390,21 +528,13 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
         .inner_size(470.0, 630.0)
         .resizable(false)
         .visible(false)
-        .transparent(true)
         .effects(effects)
-        .decorations(false)
+        .decorations(cfg!(target_os = "macos"))
         .minimizable(false);
-
-    // Platform-specific: title_bar_style and hidden_title are macOS-only
-    #[cfg(target_os = "macos")]
-    let builder = builder
-        .title_bar_style(TitleBarStyle::Overlay)
-        .hidden_title(true);
 
     match builder.build() {
         Ok(window) => {
             let _ = window.move_window(Position::Center);
-            let _ = window.create_overlay_titlebar();
             let _ = window.show();
             let _ = window.set_focus();
         }
@@ -441,19 +571,12 @@ pub fn show_settings_window_impl(app: &AppHandle) {
     .min_inner_size(600.0, 400.0)
     .visible(false)
     .resizable(true)
-    .decorations(false)
+    .decorations(cfg!(target_os = "macos"))
     .minimizable(true);
-
-    // Platform-specific: title_bar_style and hidden_title are macOS-only
-    #[cfg(target_os = "macos")]
-    let builder = builder
-        .title_bar_style(TitleBarStyle::Overlay)
-        .hidden_title(true);
 
     match builder.build() {
         Ok(window) => {
             let _ = window.move_window(Position::Center);
-            let _ = window.create_overlay_titlebar();
             let _ = window.show();
             let _ = window.set_focus();
         }
@@ -463,62 +586,48 @@ pub fn show_settings_window_impl(app: &AppHandle) {
     }
 }
 
-/// The TaskId defined in AppxManifest.xml for the startup task
-const STARTUP_TASK_ID: &str = "cloudreve";
-
-/// Get whether auto-start is enabled using Windows StartupTask API
+/// Get whether auto-start is enabled on the current platform.
 #[tauri::command]
-pub async fn get_auto_start_enabled() -> CommandResult<bool> {
-    tokio::task::spawn_blocking(|| {
-        let task_id: windows::core::HSTRING = STARTUP_TASK_ID.into();
-        let task = StartupTask::GetAsync(&task_id)
-            .map_err(|e| format!("Failed to get startup task: {}", e))?
-            .get()
-            .map_err(|e| format!("Failed to get startup task: {}", e))?;
-
-        let state = task
-            .State()
-            .map_err(|e| format!("Failed to get task state: {}", e))?;
-
-        Ok(matches!(
-            state,
-            StartupTaskState::Enabled | StartupTaskState::EnabledByPolicy
-        ))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?
+pub async fn get_auto_start_enabled(state: State<'_, AppStateHandle>) -> CommandResult<bool> {
+    state
+        .get()
+        .ok_or_else(|| "App not yet initialized".to_string())?
+        .platform
+        .auto_start()
+        .is_enabled()
+        .map_err(|e| e.to_string())
 }
 
-/// Set auto-start configuration using Windows StartupTask API
+/// Set auto-start configuration on the current platform.
 #[tauri::command]
-pub async fn set_auto_start(enabled: bool) -> CommandResult<bool> {
-    tokio::task::spawn_blocking(move || {
-        let task_id: windows::core::HSTRING = STARTUP_TASK_ID.into();
-        let task = StartupTask::GetAsync(&task_id)
-            .map_err(|e| format!("Failed to get startup task: {}", e))?
-            .get()
-            .map_err(|e| format!("Failed to get startup task: {}", e))?;
+pub async fn set_auto_start(
+    state: State<'_, AppStateHandle>,
+    enabled: bool,
+) -> CommandResult<bool> {
+    let actual_state = state
+        .get()
+        .ok_or_else(|| "App not yet initialized".to_string())?
+        .platform
+        .auto_start()
+        .set_enabled(enabled)
+        .map_err(|e| e.to_string())?;
 
-        if enabled {
-            // Request enable - may prompt user for consent
-            let new_state = task
-                .RequestEnableAsync()
-                .map_err(|e| format!("Failed to request enable: {}", e))?
-                .get()
-                .map_err(|e| format!("Failed to enable startup task: {}", e))?;
+    ConfigManager::get()
+        .set_auto_start(actual_state)
+        .map_err(|e| e.to_string())?;
 
-            Ok(matches!(
-                new_state,
-                StartupTaskState::Enabled | StartupTaskState::EnabledByPolicy
-            ))
-        } else {
-            task.Disable()
-                .map_err(|e| format!("Failed to disable startup task: {}", e))?;
-            Ok(false)
-        }
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?
+    Ok(actual_state)
+}
+
+#[tauri::command]
+pub async fn get_platform_capabilities(
+    state: State<'_, AppStateHandle>,
+) -> CommandResult<PlatformCapabilities> {
+    Ok(state
+        .get()
+        .ok_or_else(|| "App not yet initialized".to_string())?
+        .platform
+        .capabilities())
 }
 
 /// Set notification settings for credential expiry
@@ -626,7 +735,7 @@ pub async fn set_language(app: AppHandle, language: Option<String>) -> CommandRe
 
 /// Open the log folder in file explorer
 #[tauri::command]
-pub async fn open_log_folder() -> CommandResult<()> {
+pub async fn open_log_folder(state: State<'_, AppStateHandle>) -> CommandResult<()> {
     let log_dir = ConfigManager::get_log_dir();
 
     // Create the directory if it doesn't exist
@@ -634,6 +743,11 @@ pub async fn open_log_folder() -> CommandResult<()> {
         std::fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
     }
 
-    showfile::show_path_in_file_manager(format!("{}\\", log_dir.display()));
-    Ok(())
+    state
+        .get()
+        .ok_or_else(|| "App not yet initialized".to_string())?
+        .platform
+        .desktop_integration()
+        .open_in_file_manager(log_dir.as_path())
+        .map_err(|e| e.to_string())
 }

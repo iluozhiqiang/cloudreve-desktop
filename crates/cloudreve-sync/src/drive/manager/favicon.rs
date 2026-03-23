@@ -1,4 +1,3 @@
-use crate::utils::app::get_app_root;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -18,19 +17,19 @@ struct Manifest {
     icons: Vec<ManifestIcon>,
 }
 
-/// Result containing paths to both the ICO icon and raw image
+/// Result containing paths to both the shell icon and raw image
 #[derive(Debug, Clone)]
 pub struct FaviconResult {
-    /// Path to the ICO file (for Windows shell integration)
-    pub ico_path: String,
+    /// Path to the shell-friendly icon file
+    pub shell_icon_path: String,
     /// Path to the raw image file (PNG/JPG/etc, before ICO conversion)
-    pub raw_path: String,
+    pub display_icon_path: String,
 }
 
 /// Icon type for download and fallback handling
 #[derive(Debug, Clone, Copy)]
 enum IconType {
-    /// Small icon for ICO conversion (Windows shell integration)
+    /// Small icon variant for shell-facing integrations
     Small,
     /// Large icon for raw display (status UI)
     Large,
@@ -119,14 +118,29 @@ async fn download_icon(client: &reqwest::Client, url: &str) -> Result<bytes::Byt
 
 /// Get fallback icon bytes for the given icon type
 fn get_fallback_icon(icon_type: IconType) -> Result<Vec<u8>> {
-    let app_root = get_app_root();
-    let fallback_path = match icon_type {
-        IconType::Small => format!("{}\\cloudreve.ico", app_root.image_path_general()),
-        IconType::Large => format!("{}\\StoreLogo.scale-400.png", app_root.image_path_general()),
+    let (size, format) = match icon_type {
+        IconType::Small => (64, image::ImageFormat::Ico),
+        IconType::Large => (256, image::ImageFormat::Png),
     };
 
-    tracing::info!(target: "drive::favicon", path = %fallback_path, icon_type = ?icon_type, "Using fallback icon");
-    std::fs::read(&fallback_path).with_context(|| format!("Failed to read fallback icon: {}", fallback_path))
+    let image = image::RgbaImage::from_fn(size, size, |x, y| {
+        let base = if (x / 16 + y / 16) % 2 == 0 {
+            image::Rgba([36, 114, 255, 255])
+        } else {
+            image::Rgba([24, 86, 204, 255])
+        };
+        base
+    });
+
+    let dynamic = image::DynamicImage::ImageRgba8(image);
+    let mut bytes = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut bytes);
+    dynamic
+        .write_to(&mut cursor, format)
+        .context("failed to encode fallback icon")?;
+
+    tracing::info!(target: "drive::favicon", icon_type = ?icon_type, "Using generated fallback icon");
+    Ok(bytes)
 }
 
 /// Save icon bytes to destination, converting to ICO if needed
@@ -170,8 +184,8 @@ pub async fn fetch_and_save_favicon(instance_url: &str) -> Result<FaviconResult>
 
     // Get icons directory
     let icons_dir = get_icons_dir()?;
-    let ico_path = icons_dir.join(format!("{}.ico", hash));
-    let raw_path = icons_dir.join(format!("{}_raw.png", hash));
+    let shell_icon_path = icons_dir.join(format!("{}.ico", hash));
+    let display_icon_path = icons_dir.join(format!("{}_raw.png", hash));
 
     // Try to fetch and process icons from remote
     match fetch_icons_from_remote(instance_url, &icons_dir, hash).await {
@@ -184,19 +198,19 @@ pub async fn fetch_and_save_favicon(instance_url: &str) -> Result<FaviconResult>
     // Fallback: use bundled icons
     // Small icon fallback
     let small_bytes = get_fallback_icon(IconType::Small)?;
-    save_icon(&small_bytes, &ico_path, false, true)?;
-    tracing::debug!(target: "drive::favicon", path = %ico_path.display(), "Fallback ICO saved");
+    save_icon(&small_bytes, &shell_icon_path, false, true)?;
+    tracing::debug!(target: "drive::favicon", path = %shell_icon_path.display(), "Fallback shell icon saved");
 
     // Large icon fallback
     let large_bytes = get_fallback_icon(IconType::Large)?;
-    std::fs::write(&raw_path, &large_bytes).context("Failed to save fallback raw icon")?;
-    tracing::debug!(target: "drive::favicon", path = %raw_path.display(), "Fallback raw icon saved");
+    std::fs::write(&display_icon_path, &large_bytes).context("Failed to save fallback display icon")?;
+    tracing::debug!(target: "drive::favicon", path = %display_icon_path.display(), "Fallback display icon saved");
 
-    tracing::info!(target: "drive::favicon", ico_path = %ico_path.display(), raw_path = %raw_path.display(), "Fallback favicon saved successfully");
+    tracing::info!(target: "drive::favicon", shell_icon_path = %shell_icon_path.display(), display_icon_path = %display_icon_path.display(), "Fallback favicon saved successfully");
 
     Ok(FaviconResult {
-        ico_path: ico_path.to_string_lossy().to_string(),
-        raw_path: raw_path.to_string_lossy().to_string(),
+        shell_icon_path: shell_icon_path.to_string_lossy().to_string(),
+        display_icon_path: display_icon_path.to_string_lossy().to_string(),
     })
 }
 
@@ -268,23 +282,23 @@ async fn fetch_icons_from_remote(instance_url: &str, icons_dir: &PathBuf, hash: 
     };
 
     // Determine paths and extensions
-    let ico_path = icons_dir.join(format!("{}.ico", hash));
+    let shell_icon_path = icons_dir.join(format!("{}.ico", hash));
     let raw_extension = get_extension_from_icon(largest_icon, &largest_icon_url);
-    let raw_path = icons_dir.join(format!("{}_raw.{}", hash, raw_extension));
+    let display_icon_path = icons_dir.join(format!("{}_raw.{}", hash, raw_extension));
 
     // Save small icon as ICO
     let is_already_ico = is_ico_format(smallest_icon, &smallest_icon_url);
-    save_icon(&small_bytes, &ico_path, true, is_already_ico)?;
-    tracing::debug!(target: "drive::favicon", path = %ico_path.display(), "ICO saved");
+    save_icon(&small_bytes, &shell_icon_path, true, is_already_ico)?;
+    tracing::debug!(target: "drive::favicon", path = %shell_icon_path.display(), "Shell icon saved");
 
     // Save large icon as raw
-    std::fs::write(&raw_path, &large_bytes).context("Failed to save raw icon file")?;
-    tracing::debug!(target: "drive::favicon", path = %raw_path.display(), "Raw icon saved");
+    std::fs::write(&display_icon_path, &large_bytes).context("Failed to save display icon file")?;
+    tracing::debug!(target: "drive::favicon", path = %display_icon_path.display(), "Display icon saved");
 
-    tracing::info!(target: "drive::favicon", ico_path = %ico_path.display(), raw_path = %raw_path.display(), "Favicon saved successfully");
+    tracing::info!(target: "drive::favicon", shell_icon_path = %shell_icon_path.display(), display_icon_path = %display_icon_path.display(), "Favicon saved successfully");
 
     Ok(FaviconResult {
-        ico_path: ico_path.to_string_lossy().to_string(),
-        raw_path: raw_path.to_string_lossy().to_string(),
+        shell_icon_path: shell_icon_path.to_string_lossy().to_string(),
+        display_icon_path: display_icon_path.to_string_lossy().to_string(),
     })
 }

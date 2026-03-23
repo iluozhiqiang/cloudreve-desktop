@@ -1,6 +1,8 @@
-import { Box, Button, CircularProgress, Container, InputAdornment, Snackbar, Typography } from "@mui/material";
+import { Alert, Box, Button, CircularProgress, Container, InputAdornment, Snackbar, Typography } from "@mui/material";
 import { openUrl, openPath } from "@tauri-apps/plugin-opener";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { getCurrent as getCurrentDeepLink, onOpenUrl } from "@tauri-apps/plugin-deep-link";
+import { platform } from "@tauri-apps/plugin-os";
 import { invoke } from '@tauri-apps/api/core';
 import confetti from "canvas-confetti";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -46,6 +48,11 @@ interface AddDriveProps {
   mode?: "add" | "reauthorize";
 }
 
+interface LocalPathValidation {
+  normalized_path: string;
+  warning?: string | null;
+}
+
 function parseDeeplinkUrl(url: string): OAuthCallbackData | null {
   try {
     // Handle custom protocol: cloudreve://callback/desktop?code=xxx&state=xxx
@@ -88,6 +95,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
   const isReauthorize = mode === "reauthorize" && driveId && encodedSiteUrl;
   const decodedSiteUrl = encodedSiteUrl ? decodeURIComponent(encodedSiteUrl) : "";
   const isWindows10 = useIsWindows10();
+  const [osPlatform, setOsPlatform] = useState<string>("unknown");
 
   const [siteUrl, setSiteUrl] = useState(isReauthorize ? decodedSiteUrl : "");
   const [loading, setLoading] = useState(false);
@@ -97,48 +105,106 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
   const [authorizeUrl, setAuthorizeUrl] = useState<string | null>(null);
   const [pageState, setPageState] = useState<PageState>(isReauthorize ? "url_input" : "url_input");
   const [localPath, setLocalPath] = useState("");
+  const [localPathError, setLocalPathError] = useState("");
+  const [localPathWarning, setLocalPathWarning] = useState("");
+  const [validatingLocalPath, setValidatingLocalPath] = useState(false);
   const [driveName, setDriveName] = useState(driveNameQuery ? decodeURIComponent(driveNameQuery) : "");
   const lastFetchedUrl = useRef<string>("");
   const currentIconUrl = useRef<string | undefined>(undefined);
   const pkceSessionRef = useRef<PKCESession | null>(null);
   const hasInitialized = useRef(false);
 
+  useEffect(() => {
+    try {
+      setOsPlatform(platform());
+    } catch {
+      setOsPlatform("unknown");
+    }
+  }, []);
+
+  const localPathPlaceholder = (() => {
+    if (osPlatform === "macos") {
+      return t("addDrive.localPathPlaceholderMac");
+    }
+    if (osPlatform === "windows") {
+      return t("addDrive.localPathPlaceholderWin");
+    }
+    return t("addDrive.localPathPlaceholder");
+  })();
+
+  const localPathTips = (() => {
+    if (osPlatform === "macos") {
+      return t("addDrive.localPathTipsMac");
+    }
+    if (osPlatform === "windows") {
+      return t("addDrive.localPathTipsWin");
+    }
+    return t("addDrive.localPathTipsOther");
+  })();
+
+  const handleOAuthCallbackUrl = useCallback((url: string) => {
+    console.log("Received OAuth callback URL:", url);
+
+    const callbackData = parseDeeplinkUrl(url);
+    if (!callbackData) {
+      console.error("Failed to parse deeplink URL:", url);
+      return;
+    }
+
+    if (!pkceSessionRef.current || callbackData.state !== pkceSessionRef.current.state) {
+      console.error("State mismatch or no active session", pkceSessionRef.current, callbackData);
+      setError(t("addDrive.errors.stateMismatch"));
+      setSnackbarOpen(true);
+      return;
+    }
+
+    pkceSessionRef.current.callbackData = callbackData;
+    callbackData.name && setDriveName(callbackData.name);
+    setPageState("final_setup");
+  }, [t]);
+
   // Listen for deeplink events from OAuth callback
   useEffect(() => {
-    let unlisten: () => void;
+    let unlistenLegacy: (() => void) | undefined;
+    let unlistenPlugin: (() => void) | undefined;
+    let disposed = false;
+
     listen<string>('deeplink', (event) => {
-      console.log("Received deeplink event:", event.payload);
-
-      const callbackData = parseDeeplinkUrl(event.payload);
-      if (!callbackData) {
-        console.error("Failed to parse deeplink URL:", event.payload);
-        return;
-      }
-
-      // Verify state matches current session
-      if (!pkceSessionRef.current || callbackData.state !== pkceSessionRef.current.state) {
-        console.error("State mismatch or no active session", pkceSessionRef.current, callbackData);
-        setError(t("addDrive.errors.stateMismatch"));
-        setSnackbarOpen(true);
-        return;
-      }
-
-      // Store the auth code in the session
-      pkceSessionRef.current.callbackData = callbackData;
-
-      // Transition to final setup page
-      callbackData.name && setDriveName(callbackData.name);
-      setPageState("final_setup");
+      handleOAuthCallbackUrl(event.payload);
     }).then((fn) => {
-      unlisten = fn;
+      if (disposed) {
+        fn();
+        return;
+      }
+      unlistenLegacy = fn;
     });
 
-    return () => {
-      if (unlisten) {
-        unlisten();
+    onOpenUrl((urls) => {
+      urls.forEach((url) => handleOAuthCallbackUrl(url));
+    }).then((fn) => {
+      if (disposed) {
+        fn();
+        return;
       }
+      unlistenPlugin = fn;
+    }).catch((error) => {
+      console.warn("Failed to subscribe to plugin deep link events:", error);
+    });
+
+    getCurrentDeepLink()
+      .then((urls) => {
+        urls?.forEach((url) => handleOAuthCallbackUrl(url));
+      })
+      .catch((error) => {
+        console.warn("Failed to get current deep link payload:", error);
+      });
+
+    return () => {
+      disposed = true;
+      unlistenLegacy?.();
+      unlistenPlugin?.();
     };
-  }, [t]);
+  }, [handleOAuthCallbackUrl]);
 
   // Fetch site icon when URL changes and is valid
   const handleUrlBlur = () => {
@@ -276,6 +342,8 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
     setAuthorizeUrl(null);
     setPageState("url_input");
     setLocalPath("");
+    setLocalPathError("");
+    setLocalPathWarning("");
     pkceSessionRef.current = null;
   };
 
@@ -291,13 +359,55 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
     });
     if (selected) {
       setLocalPath(selected);
+      setLocalPathError("");
+      setLocalPathWarning("");
     }
   };
 
+  const validateLocalPath = useCallback(async () => {
+    if (isReauthorize) {
+      return localPath;
+    }
+
+    setValidatingLocalPath(true);
+    try {
+      const result = await invoke<LocalPathValidation>("validate_local_sync_path", {
+        path: localPath,
+        driveId: undefined,
+      });
+      setLocalPathError("");
+      setLocalPathWarning(result.warning ?? "");
+      if (result.normalized_path !== localPath) {
+        setLocalPath(result.normalized_path);
+      }
+      return result.normalized_path;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setLocalPathError(message);
+      setLocalPathWarning("");
+      return null;
+    } finally {
+      setValidatingLocalPath(false);
+    }
+  }, [isReauthorize, localPath]);
+
   const handleFinish = async (e: React.FormEvent) => {
     e.preventDefault();
+    const trimmedDriveName = driveName.trim();
+    if (!trimmedDriveName) {
+      return;
+    }
+
+    let validatedLocalPath = localPath;
+    if (!isReauthorize) {
+      const result = await validateLocalPath();
+      if (!result) {
+        return;
+      }
+      validatedLocalPath = result;
+    }
+
     setPageState("setting_up");
-    // TODO: Call backend to complete drive setup
 
     let tokens: TokenResponse;
     try {
@@ -329,8 +439,8 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
           refresh_token: tokens.refresh_token,
           access_token_expires: tokens.expires_in,
           refresh_token_expires: tokens.refresh_token_expires_in,
-          drive_name: driveName,
-          local_path: localPath,
+          drive_name: trimmedDriveName,
+          local_path: validatedLocalPath,
           remote_path: pkceSessionRef.current!.callbackData!.path,
           user_id: pkceSessionRef.current!.callbackData!.user_id || "",
           drive_id: isReauthorize ? driveId : undefined,
@@ -341,7 +451,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setError(t("addDrive.errors.addDriveFailed", { message }));
-      setPageState("url_input");
+      setPageState("final_setup");
       setSnackbarOpen(true);
     }
   }
@@ -470,6 +580,28 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                 {isReauthorize ? t("addDrive.reauthorizeDescription") : t("addDrive.finalSetupDescription")}
               </Typography>
 
+              {!isReauthorize && (
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  textAlign="center"
+                  sx={{ display: "block", px: 1 }}
+                >
+                  {t("addDrive.stepProgress", { current: 3, total: 3 })} · {t("addDrive.step3Body")}
+                </Typography>
+              )}
+
+              {!isReauthorize && (
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  textAlign="center"
+                  sx={{ display: "block", px: 1, mt: -0.5 }}
+                >
+                  {localPathTips}
+                </Typography>
+              )}
+
               <Box
                 component="form"
                 onSubmit={handleFinish}
@@ -497,11 +629,17 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                     fullWidth
                     autoComplete="off"
                     label={t("addDrive.localPath")}
-                    placeholder={t("addDrive.localPathPlaceholder")}
+                    placeholder={localPathPlaceholder}
                     value={localPath}
-                    onChange={(e) => setLocalPath(e.target.value)}
+                    onChange={(e) => {
+                      setLocalPath(e.target.value);
+                      setLocalPathError("");
+                      setLocalPathWarning("");
+                    }}
                     variant="filled"
                     required
+                    error={Boolean(localPathError)}
+                    helperText={localPathError || localPathWarning || " "}
                     slotProps={{
                       input: {
                         endAdornment: (
@@ -524,6 +662,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                   variant="contained"
                   size="large"
                   fullWidth
+                  disabled={validatingLocalPath || (!isReauthorize && !localPath.trim()) || !driveName.trim()}
                 >
                   {isReauthorize ? t("addDrive.reauthorizeConfirm") : t("addDrive.finish")}
                 </Button>
@@ -557,6 +696,37 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
               >
                 {t("addDrive.waitingDescription")}
               </Typography>
+
+              {isReauthorize ? (
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  textAlign="center"
+                  sx={{ display: "block", px: 1 }}
+                >
+                  {t("addDrive.reauthorizeWaitingHint")}
+                </Typography>
+              ) : (
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  textAlign="center"
+                  sx={{ display: "block", px: 1 }}
+                >
+                  {t("addDrive.stepProgress", { current: 2, total: 3 })} · {t("addDrive.step2Body")}
+                </Typography>
+              )}
+
+              {osPlatform === "macos" && (
+                <Typography
+                  variant="caption"
+                  color="warning.main"
+                  textAlign="center"
+                  sx={{ display: "block", px: 1 }}
+                >
+                  {t("addDrive.waitingDeepLinkMac")}
+                </Typography>
+              )}
 
               <Box
                 sx={{
@@ -606,6 +776,17 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                 {t("addDrive.description")}
               </Typography>
 
+              {!isReauthorize && (
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  textAlign="center"
+                  sx={{ display: "block", px: 1 }}
+                >
+                  {t("addDrive.stepProgress", { current: 1, total: 3 })} · {t("addDrive.step1Body")}
+                </Typography>
+              )}
+
               <Box
                 component="form"
                 onSubmit={handleSubmit}
@@ -651,10 +832,19 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
       </Box>
       <Snackbar
         open={snackbarOpen}
-        autoHideDuration={6000}
+        autoHideDuration={8000}
         onClose={handleCloseSnackbar}
-        message={error}
-      />
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      >
+        <Alert
+          onClose={handleCloseSnackbar}
+          severity="error"
+          variant="filled"
+          sx={{ width: "100%", maxWidth: 480 }}
+        >
+          {error}
+        </Alert>
+      </Snackbar>
     </Container>
   );
 }

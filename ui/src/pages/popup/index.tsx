@@ -1,7 +1,9 @@
 import {
+  Alert,
   Box,
   IconButton,
   List,
+  Snackbar,
   Typography,
   Divider,
 } from "@mui/material";
@@ -9,6 +11,7 @@ import {
   Folder as FolderIcon,
   CheckCircle as CheckCircleIcon,
   Refresh as RefreshIcon,
+  WarningAmber as WarningAmberIcon,
 } from "@mui/icons-material";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -17,14 +20,18 @@ import { useTranslation } from "react-i18next";
 import Settings from "../../common/icons/Settings";
 import CloudreveLogo from "../../common/CloudreveLogo";
 import type { StatusSummary } from "./types";
+import type { DriveInfo } from "../settings/types";
 import DriveChips from "./DriveChips";
+import DriveStatusOverview from "./DriveStatusOverview";
 import TaskItem from "./TaskItem";
 
 export default function Popup() {
   const { t } = useTranslation();
   const [summary, setSummary] = useState<StatusSummary | null>(null);
+  const [driveInfos, setDriveInfos] = useState<DriveInfo[]>([]);
   const [selectedDrive, setSelectedDrive] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [uiError, setUiError] = useState("");
   const isFetchingRef = useRef(false);
 
   // Close window on blur (when it loses focus)
@@ -55,17 +62,27 @@ export default function Popup() {
 
     isFetchingRef.current = true;
     try {
-      const result = await invoke<StatusSummary>("get_status_summary", {
-        driveId: selectedDrive,
-      });
-      setSummary(result);
+      const [summaryResult, drivesResult] = await Promise.all([
+        invoke<StatusSummary>("get_status_summary", {
+          driveId: null,
+        }),
+        invoke<DriveInfo[]>("get_drives_info"),
+      ]);
+      setSummary(summaryResult);
+      setDriveInfos(
+        drivesResult.map((drive) => ({
+          ...drive,
+          status: drive.status as DriveInfo["status"],
+        }))
+      );
     } catch (error) {
       console.error("Failed to fetch status summary:", error);
+      setUiError(t("popup.loadFailed", "Failed to load sync status."));
     } finally {
       isFetchingRef.current = false;
       setLoading(false);
     }
-  }, [selectedDrive]);
+  }, []);
 
   // Initial fetch and polling
   useEffect(() => {
@@ -89,6 +106,7 @@ export default function Popup() {
       await invoke("show_add_drive_window");
     } catch (error) {
       console.error("Failed to open add drive window:", error);
+      setUiError(t("popup.openAddDriveFailed", "Failed to open the add drive window."));
     }
   };
 
@@ -97,13 +115,49 @@ export default function Popup() {
       await invoke("show_settings_window");
     } catch (error) {
       console.error("Failed to open settings window:", error);
+      setUiError(t("popup.openSettingsFailed", "Failed to open settings."));
     }
   };
 
+  const handleOpenFolder = async (path: string) => {
+    try {
+      await invoke("show_file_in_explorer", { path });
+    } catch (error) {
+      console.error("Failed to open folder:", error);
+      const message = error instanceof Error ? error.message : String(error);
+      setUiError(message);
+    }
+  };
+
+  const handleReauthorize = async (drive: DriveInfo) => {
+    try {
+      await invoke("show_reauthorize_window", {
+        driveId: drive.id,
+        siteUrl: drive.instance_url,
+        driveName: drive.name,
+      });
+    } catch (error) {
+      console.error("Failed to open reauthorize window:", error);
+      setUiError(t("popup.openReauthorizeFailed", "Failed to open reauthorization."));
+    }
+  };
+
+  const displayedActiveTasks = selectedDrive
+    ? (summary?.active_tasks ?? []).filter((task) => task.drive_id === selectedDrive)
+    : (summary?.active_tasks ?? []);
+  const displayedFinishedTasks = selectedDrive
+    ? (summary?.finished_tasks ?? []).filter((task) => task.drive_id === selectedDrive)
+    : (summary?.finished_tasks ?? []);
+
   const hasActiveTasks =
-    summary?.active_tasks && summary.active_tasks.length > 0;
+    displayedActiveTasks.length > 0;
   const hasFinishedTasks =
-    summary?.finished_tasks && summary.finished_tasks.length > 0;
+    displayedFinishedTasks.length > 0;
+  const selectedDriveInfo = selectedDrive
+    ? driveInfos.find((drive) => drive.id === selectedDrive) ?? null
+    : null;
+  const issueDrives = driveInfos.filter((drive) => drive.status !== "active");
+  const hasSelectedDriveIssue = selectedDriveInfo && selectedDriveInfo.status !== "active";
 
   return (
     <Box
@@ -152,6 +206,15 @@ export default function Popup() {
           onAddDrive={handleAddDrive}
         />
       </Box>
+
+      <DriveStatusOverview
+        drives={driveInfos}
+        selectedDrive={selectedDrive}
+        activeTasks={summary?.active_tasks ?? []}
+        finishedTasks={summary?.finished_tasks ?? []}
+        onOpenFolder={handleOpenFolder}
+        onReauthorize={handleReauthorize}
+      />
 
       {/* Task List */}
       <Box sx={{ flex: 1, overflow: "auto" }}>
@@ -203,8 +266,13 @@ export default function Popup() {
                 >
                   {t("popup.syncing", "Syncing")}
                 </Typography>
-                {summary?.active_tasks.map((task) => (
-                  <TaskItem key={task.id} task={task} isActive />
+                {displayedActiveTasks.map((task) => (
+                  <TaskItem
+                    key={task.id}
+                    task={task}
+                    isActive
+                    onRevealPath={handleOpenFolder}
+                  />
                 ))}
               </>
             )}
@@ -231,8 +299,12 @@ export default function Popup() {
                 >
                   {t("popup.recent", "Recent")}
                 </Typography>
-                {summary?.finished_tasks.map((task) => (
-                  <TaskItem key={task.id} task={task} />
+                {displayedFinishedTasks.map((task) => (
+                  <TaskItem
+                    key={task.id}
+                    task={task}
+                    onRevealPath={handleOpenFolder}
+                  />
                 ))}
               </>
             )}
@@ -264,6 +336,8 @@ export default function Popup() {
               },
             }}
           />
+        ) : hasSelectedDriveIssue || issueDrives.length > 0 ? (
+          <WarningAmberIcon sx={{ fontSize: 18, color: "warning.main" }} />
         ) : (
           <CheckCircleIcon
             sx={{ fontSize: 18, color: "success.main" }}
@@ -272,11 +346,30 @@ export default function Popup() {
         <Typography variant="caption" color="text.secondary">
           {hasActiveTasks
             ? t("popup.syncingStatus", "Syncing {{count}} file(s)...", {
-                count: summary?.active_tasks.length ?? 0,
+                count: displayedActiveTasks.length ?? 0,
               })
+            : hasSelectedDriveIssue
+              ? selectedDriveInfo?.status === "credential_expired"
+                ? t("popup.driveNeedsReauth", "This drive needs reauthorization")
+                : t("popup.driveNeedsAttention", "This drive needs attention")
+              : issueDrives.length > 0
+                ? t("popup.drivesNeedAttention", {
+                    count: issueDrives.length,
+                    defaultValue: "{{count}} drive(s) need attention",
+                  })
             : t("popup.upToDate", "Your files are up to date")}
         </Typography>
       </Box>
+      <Snackbar
+        open={Boolean(uiError)}
+        autoHideDuration={3500}
+        onClose={() => setUiError("")}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      >
+        <Alert severity="error" onClose={() => setUiError("")} sx={{ width: "100%" }}>
+          {uiError}
+        </Alert>
+      </Snackbar>
     </Box>
   );
 }

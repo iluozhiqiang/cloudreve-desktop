@@ -23,9 +23,31 @@ import FileIcon from "./FileIcon";
 interface TaskItemProps {
   task: TaskWithProgress | TaskRecord;
   isActive?: boolean;
+  onRevealPath?: (path: string) => void;
 }
 
-export default function TaskItem({ task, isActive = false }: TaskItemProps) {
+function getFriendlyTaskError(message: string, t: ReturnType<typeof useTranslation>["t"]) {
+  const normalized = message.toLowerCase();
+  if (normalized.includes("conflict") || normalized.includes("409")) {
+    return t(
+      "popup.conflictTaskError",
+      "This file conflicted with a remote change. Review the conflict before continuing."
+    );
+  }
+  if (
+    (normalized.includes("credential") && normalized.includes("expired")) ||
+    normalized.includes("unauthorized") ||
+    normalized.includes("401")
+  ) {
+    return t(
+      "popup.credentialExpiredTaskError",
+      "Drive credentials expired. Reauthorize this drive to continue syncing."
+    );
+  }
+  return message;
+}
+
+export default function TaskItem({ task, isActive = false, onRevealPath }: TaskItemProps) {
   const { t } = useTranslation();
   const activeTask = task as TaskWithProgress;
   const liveProgress = activeTask.live_progress;
@@ -50,6 +72,10 @@ export default function TaskItem({ task, isActive = false }: TaskItemProps) {
   const handleShowInExplorer = (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    if (onRevealPath) {
+      onRevealPath(task.local_path);
+      return;
+    }
     invoke("show_file_in_explorer", { path: task.local_path });
   };
 
@@ -132,8 +158,8 @@ export default function TaskItem({ task, isActive = false }: TaskItemProps) {
         secondary={
           <Box>
             {isFailed && task.error ? (
-              <Typography variant="caption" color="error" component="span">
-                {task.error}
+              <Typography variant="caption" color="error" component="span" title={task.error}>
+                {getFriendlyTaskError(task.error, t)}
               </Typography>
             ) : (
               <Typography variant="caption" color="text.secondary" component="span">

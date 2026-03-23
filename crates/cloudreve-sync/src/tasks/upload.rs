@@ -1,9 +1,9 @@
-use std::{path::PathBuf, str::FromStr, sync::Arc, time::SystemTime};
+use std::{path::PathBuf, str::FromStr, sync::Arc};
 
-use crate::utils::toast::send_conflict_toast;
 use crate::{
     drive::{placeholder::CrPlaceholder, utils::local_path_to_cr_uri},
     inventory::{ConflictState, FileMetadata, InventoryDb},
+    platform_provider,
     tasks::queue::QueuedTask,
     uploader::{ProgressCallback, ProgressUpdate, UploadParams, Uploader, UploaderConfig},
 };
@@ -109,7 +109,7 @@ impl<'a> UploadTask<'a> {
             return Ok(());
         }
 
-        if placeholder_file.local_file_info.in_sync()
+        if placeholder_file.local_file_info.is_in_sync()
             && !placeholder_file.local_file_info.is_directory()
         {
             info!(
@@ -206,14 +206,16 @@ impl<'a> UploadTask<'a> {
                     }
 
                     // Send conflict toast
-                    send_conflict_toast(
-                        self.drive_id,
-                        &self.task.payload.local_path,
-                        self.inventory_meta
-                            .as_ref()
-                            .map(|meta| meta.id)
-                            .unwrap_or(0),
-                    )
+                    if let Ok(platform) = platform_provider() {
+                        platform.desktop_integration().send_conflict_notification(
+                            self.drive_id,
+                            &self.task.payload.local_path,
+                            self.inventory_meta
+                                .as_ref()
+                                .map(|meta| meta.id)
+                                .unwrap_or(0),
+                        )
+                    }
                 }
 
                 // Mark file as error state
@@ -302,11 +304,10 @@ impl<'a> UploadTask<'a> {
             remote_uri: uri,
             file_size,
             mime_type: None, // Could be detected from file extension
-            last_modified: local_file.local_file_info.last_modified.map(|t| {
-                t.duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as i64
-            }),
+            last_modified: local_file
+                .local_file_info
+                .last_modified_unix
+                .map(|timestamp| timestamp.saturating_mul(1000)),
             overwrite: !is_new_file || self.task.payload.force_override,
             previous_version,
             task_id: self.task.task_id.clone(),

@@ -65,7 +65,6 @@ export default function Settings() {
       >
         {/* Title with drag region */}
         <Box
-          data-tauri-drag-region
           sx={{
             px: 2,
             pt: 2,
@@ -75,7 +74,18 @@ export default function Settings() {
             gap: 1.5,
           }}
         >
-          <CloudreveLogo height={24} />
+          <Box
+            data-tauri-drag-region
+            sx={{
+              display: "flex",
+              alignItems: "center",
+              gap: 1.5,
+              flex: 1,
+              minWidth: 0,
+            }}
+          >
+            <CloudreveLogo height={24} />
+          </Box>
         </Box>
 
         {/* Navigation Items */}

@@ -1,8 +1,3 @@
-use crate::cfapi::root::{
-    Connection, HydrationType, PopulationType, SecurityId, Session, SyncRootId, SyncRootIdBuilder,
-    SyncRootInfo,
-};
-use crate::drive::callback::CallbackHandler;
 use crate::drive::commands::ManagerCommand;
 use crate::drive::commands::MountCommand;
 use crate::drive::event_blocker::EventBlocker;
@@ -11,25 +6,24 @@ use crate::drive::sync::group_fs_events;
 use crate::drive::utils::recycle_bin_url;
 use crate::inventory::{DrivePropsUpdate, InventoryDb, TaskRecord};
 use crate::tasks::{TaskProgress, TaskQueue, TaskQueueConfig};
-use crate::utils::toast;
 use ::serde::{Deserialize, Serialize};
 use anyhow::{Context, Result};
 use cloudreve_api::api::user::UserApi;
 use cloudreve_api::{Client, ClientConfig, models::user::Token};
 use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
-use sha2::{Digest, Sha256};
 use std::time::Duration;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
 };
+use cloudreve_platforms_api::{
+    MountRegistrationContext, MountRegistrationCustomState, MountSession, PlatformProvider,
+};
 use tokio::spawn;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
-use url::Url;
-use windows::Storage::Provider::StorageProviderSyncRootManager;
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DriveConfig {
     pub id: String,
@@ -44,8 +38,8 @@ pub struct DriveConfig {
     pub enabled: bool,
     pub user_id: String,
 
-    // Windows CFAPI
-    pub sync_root_id: Option<SyncRootId>,
+    #[serde(alias = "sync_root_id")]
+    pub mount_id: Option<String>,
 
     /// List of gitignore-style patterns for files/directories to ignore during sync
     #[serde(default)]
@@ -128,7 +122,8 @@ type FsWatcher = Debouncer<RecommendedWatcher, RecommendedCache>;
 
 pub struct Mount {
     pub config: Arc<RwLock<DriveConfig>>,
-    connection: Option<Connection<CallbackHandler>>,
+    connection: Option<Box<dyn MountSession>>,
+    platform: Arc<dyn PlatformProvider>,
     pub command_tx: mpsc::UnboundedSender<MountCommand>,
     command_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<MountCommand>>>>,
     processor_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -153,6 +148,7 @@ impl Mount {
         config: DriveConfig,
         inventory: Arc<InventoryDb>,
         manager_command_tx: mpsc::UnboundedSender<ManagerCommand>,
+        platform: Arc<dyn PlatformProvider>,
     ) -> Self {
         // let task_config = TaskManagerConfig {
         //     max_workers: 4,
@@ -241,6 +237,7 @@ impl Mount {
         Self {
             config: Arc::new(RwLock::new(config)),
             connection: None,
+            platform,
             command_tx,
             command_rx: Arc::new(tokio::sync::Mutex::new(Some(command_rx))),
             processor_handle: Arc::new(tokio::sync::Mutex::new(None)),
@@ -324,7 +321,7 @@ impl Mount {
             let drive_id = config.id.clone();
             drop(config);
 
-            toast::send_token_expiry_toast(
+            self.platform.desktop_integration().send_token_expiry_notification(
                 &drive_id,
                 &t!("credentialExpiredTitle"),
                 &t!("credentialExpiredMessage", "drive" => drive_name),
@@ -353,74 +350,63 @@ impl Mount {
     }
 
     pub async fn start(&mut self) -> Result<()> {
-        if !StorageProviderSyncRootManager::IsSupported()
-            .context("Cloud Filter API is not supported")?
-        {
-            return Err(anyhow::anyhow!("Cloud Filter API is not supported"));
-        }
-
+        let mount_registration_supported = self.platform.mounts().is_supported()?;
         let mut write_guard = self.config.write().await;
-
-        // if sync root id is not set, generate one
-        if write_guard.sync_root_id.is_none() {
-            write_guard.sync_root_id = Some(
-                generate_sync_root_id(
+        if write_guard.mount_id.is_none() {
+            write_guard.mount_id = Some(
+                self.platform.mounts().ensure_mount_id(
                     &write_guard.instance_url,
-                    &write_guard.name,
                     &write_guard.user_id,
                     &write_guard.sync_path,
-                )
-                .context("failed to generate sync root id")?,
+                )?,
             );
         }
 
         drop(write_guard);
         let config = self.config.read().await;
-
-        let sync_root_id = config.sync_root_id.as_ref().unwrap();
-
-        // Register sync root if not registered
-        if !sync_root_id.is_registered()? {
-            tracing::info!(target: "drive::mounts", id = %self.id, "Registering sync root");
-            let mut sync_root_info = SyncRootInfo::default();
-            sync_root_info.set_display_name(config.name.clone());
-            sync_root_info.set_hydration_type(HydrationType::Full);
-            sync_root_info.set_population_type(PopulationType::Full);
-            if let Some(icon_path) = config.icon_path.as_ref() {
-                sync_root_info.set_icon(format!("{},0", icon_path));
-            }
-            sync_root_info.set_version("1.0.0");
-            sync_root_info
-                .set_recycle_bin_uri(recycle_bin_url(&config).unwrap_or_else(|_| "https://cloudreve.org".to_string()))
-                .context("failed to set recycle bin uri")?;
-            sync_root_info
-                .set_path(Path::new(&config.sync_path))
-                .context("failed to set sync root path")?;
-            sync_root_info.add_custom_state(t!("shared").as_ref(), 1)?;
-            sync_root_info.add_custom_state(t!("accessible").as_ref(), 2)?;
-            sync_root_id
-                .register(sync_root_info)
-                .context("failed to register sync root")?;
-        }
-
-        // Add to search indexer for state management
-        if let Err(e) = sync_root_id.index() {
-            tracing::warn!(target: "drive::mounts", id = %self.id, error = %e, "Failed to add sync root to search indexer");
-        }
-
-        tracing::info!(target: "drive::mounts",sync_path = %config.sync_path.display(), id = %self.id, "Connecting to sync root");
-        let connection = Session::new()
-            .connect(
-                &config.sync_path,
-                CallbackHandler::new(
+        let mount_id = config
+            .mount_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("mount id is missing"))?;
+        let recycle_bin_url = recycle_bin_url(&config).ok();
+        let context = MountRegistrationContext {
+            mount_id,
+            display_name: config.name.clone(),
+            sync_path: config.sync_path.clone(),
+            icon_path: config.icon_path.clone(),
+            recycle_bin_url,
+            custom_states: vec![
+                MountRegistrationCustomState {
+                    id: 1,
+                    label: t!("shared").to_string(),
+                },
+                MountRegistrationCustomState {
+                    id: 2,
+                    label: t!("accessible").to_string(),
+                },
+            ],
+        };
+        if mount_registration_supported {
+            tracing::info!(target: "drive::mounts", sync_path = %config.sync_path.display(), id = %self.id, "Connecting to platform mount");
+            let connection = self.platform.mounts().connect_mount(
+                &context,
+                Arc::new(crate::drive::callback::MountedDriveCallbackAdapter::new(
                     self.command_tx.clone(),
                     self.id.clone(),
                     self.inventory.clone(),
-                ),
-            )
-            .context("failed to connect to sync root")?;
+                )),
+            )?;
 
-        self.connection = Some(connection);
+            self.connection = Some(connection);
+        } else {
+            tracing::info!(
+                target: "drive::mounts",
+                sync_path = %config.sync_path.display(),
+                id = %self.id,
+                mount_id = %context.mount_id,
+                "Platform mount registration is unavailable, starting in local-sync mode"
+            );
+        }
         self.start_fs_watcher().await?;
         Ok(())
     }
@@ -548,16 +534,11 @@ impl Mount {
                     tracing::warn!(target: "drive::mounts", id = %mount_id, "Credential invalid, marking as expired");
                     s.set_credential_expired(true).await;
                 }
-                MountCommand::FetchData {
-                    path,
-                    ticket,
-                    range,
-                    response,
-                } => {
+                MountCommand::FetchData { request, response } => {
                     let s_clone = s.clone();
                     let mount_id_clone = mount_id.clone();
                     spawn(async move {
-                        let result = s_clone.fetch_data(path, ticket, range).await;
+                        let result = s_clone.fetch_data(request).await;
                         if let Err(e) = result {
                             tracing::error!(target: "drive::mounts", id = %mount_id_clone, error = ?e, "Failed to fetch data");
                             let _ = response.send(Err(e));
@@ -599,12 +580,13 @@ impl Mount {
             connection.disconnect().context("faield to disconnect sync root")?;
         }
         self.task_queue.shutdown().await;
-        if let Some(sync_root_id) = self.config.read().await.sync_root_id.as_ref() {
-            if let Err(e) = sync_root_id.unregister() {
+        let mount_id = self.config.read().await.mount_id.clone().unwrap_or_default();
+        self.platform
+            .mounts()
+            .unregister_mount(&mount_id)
+            .inspect_err(|e| {
                 tracing::warn!(target: "drive::mounts", id=%self.id, error=%e, "Failed to unregister sync root");
-                return Err(anyhow::anyhow!("Failed to unregister sync root: {}", e));
-            }
-        }
+            })?;
         if let Err(e) = self.inventory.nuke_drive(&self.id) {
             tracing::error!(target: "drive::mounts", id=%self.id, error=%e, "Failed to nuke drive");
         }
@@ -727,38 +709,6 @@ impl Mount {
             .get_drive_props(&self.id)
             .context("Failed to get drive props")
     }
-}
-
-fn generate_sync_root_id(
-    instance_url: &str,
-    _account_name: &str,
-    user_id: &str,
-    sync_path: &PathBuf,
-) -> Result<SyncRootId> {
-    // Parse the instance URL to get the hostname
-    let url = Url::parse(instance_url)?;
-    let hostname = url
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("Invalid URL: no host found"))?;
-
-    // Generate a SHA-256 hash of the hostname
-    let mut hasher = Sha256::new();
-    hasher.update(hostname.as_bytes());
-    hasher.update(sync_path.to_string_lossy().as_bytes());
-    let hash_result = hasher.finalize();
-
-    // Convert hash to hex string and truncate to reasonable length
-    // Use first 16 characters (64 bits) of the hash for the provider name
-    let hash_hex = format!("{:x}", hash_result);
-    let provider_name = format!("cloudreve{}", &hash_hex[..16]);
-
-    // Build the sync root ID
-    let sync_root_id = SyncRootIdBuilder::new(provider_name)
-        .user_security_id(SecurityId::current_user()?)
-        .account_name(user_id)
-        .build();
-
-    Ok(sync_root_id)
 }
 
 fn resolve_task_queue_config(config: &DriveConfig) -> TaskQueueConfig {

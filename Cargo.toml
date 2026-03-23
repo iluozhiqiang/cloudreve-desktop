@@ -1,8 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/app-config",
     "crates/cloudreve-api",
     "crates/cloudreve-sync",
-    "crates/win32_notif",
+    "crates/platforms/api",
+    "crates/platforms/macos",
+    "crates/platforms/windows",
+    "crates/platforms/windows/cfapi",
+    "crates/platforms/windows/notif",
     "src-tauri",
 ]
