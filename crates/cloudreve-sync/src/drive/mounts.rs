@@ -499,6 +499,20 @@ impl Mount {
                         }
                     });
                 }
+                MountCommand::ApplyRemoteDeletes { paths } => {
+                    let s_clone = s.clone();
+                    let mount_id_clone = mount_id.clone();
+                    spawn(async move {
+                        if let Err(e) = s_clone.apply_remote_deletes_fast(paths).await {
+                            tracing::error!(
+                                target: "drive::mounts",
+                                id = %mount_id_clone,
+                                error = %e,
+                                "Failed to apply remote deletes"
+                            );
+                        }
+                    });
+                }
                 MountCommand::FetchPlaceholders { path, response } => {
                     let s_clone = s.clone();
                     let mount_id_clone = mount_id.clone();
@@ -545,6 +559,24 @@ impl Mount {
                             return;
                         }
                         tracing::debug!(target: "drive::mounts", id = %mount_id_clone, result = ?result, "Fetched data");
+                        let _ = response.send(result);
+                    });
+                }
+                MountCommand::GetItemState { path, response } => {
+                    let s_clone = s.clone();
+                    let mount_id_clone = mount_id.clone();
+                    spawn(async move {
+                        let result = s_clone.get_item_state(path).await;
+                        if let Err(e) = result {
+                            tracing::error!(
+                                target: "drive::mounts",
+                                id = %mount_id_clone,
+                                error = ?e,
+                                "Failed to get item state"
+                            );
+                            let _ = response.send(Err(e));
+                            return;
+                        }
                         let _ = response.send(result);
                     });
                 }

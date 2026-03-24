@@ -10,7 +10,7 @@ use tauri::{
     AppHandle, Emitter, Manager, RunEvent,
 };
 use tauri_plugin_deep_link::DeepLinkExt;
-use tokio::sync::OnceCell;
+use tokio::sync::{Notify, OnceCell};
 
 use crate::commands::{show_add_drive_window_impl, show_main_window, show_settings_window_impl};
 mod commands;
@@ -22,6 +22,10 @@ mod windows_shell_host;
 extern crate rust_i18n;
 
 i18n!("../locales");
+
+/// Global cell to store the app state once initialization is complete
+static APP_STATE: OnceCell<AppState> = OnceCell::const_new();
+static APP_READY: Notify = Notify::const_new();
 
 /// Initialize i18n based on config setting or system locale
 fn init_i18n() {
@@ -57,8 +61,32 @@ pub struct AppState {
     shell_service: Mutex<ShellServiceHandle>,
 }
 
-/// Global cell to store the app state once initialization is complete
-static APP_STATE: OnceCell<AppState> = OnceCell::const_new();
+/// Marker struct for Tauri state that provides access to APP_STATE
+pub struct AppStateHandle;
+
+impl AppStateHandle {
+    pub fn get(&self) -> Option<&'static AppState> {
+        APP_STATE.get()
+    }
+
+    pub async fn wait_for_ready(&self) -> &'static AppState {
+        // Double-checked locking pattern to avoid race conditions
+        if let Some(state) = APP_STATE.get() {
+            return state;
+        }
+
+        let notified = APP_READY.notified();
+
+        if let Some(state) = APP_STATE.get() {
+            return state;
+        }
+
+        notified.await;
+        APP_STATE
+            .get()
+            .expect("App state must be set after notification")
+    }
+}
 
 enum ShellServiceHandle {
     #[cfg(target_os = "windows")]
@@ -164,21 +192,11 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
         .set(state)
         .map_err(|_| anyhow::anyhow!("App state already initialized"))?;
 
-    // Store in Tauri's managed state as well for commands
-    app.manage(AppStateHandle);
+    APP_READY.notify_waiters();
 
     tracing::info!(target: "main", "Tauri application setup complete");
 
     Ok(())
-}
-
-/// Marker struct for Tauri state that provides access to APP_STATE
-pub struct AppStateHandle;
-
-impl AppStateHandle {
-    pub fn get(&self) -> Option<&'static AppState> {
-        APP_STATE.get()
-    }
 }
 
 /// Spawn a task that bridges EventBroadcaster to Tauri events
@@ -241,13 +259,8 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
         true,
         None::<&str>,
     )?;
-    let settings_i = MenuItem::with_id(
-        app,
-        "settings",
-        t!("settings").as_ref(),
-        true,
-        None::<&str>,
-    )?;
+    let settings_i =
+        MenuItem::with_id(app, "settings", t!("settings").as_ref(), true, None::<&str>)?;
     let quit_i = MenuItem::with_id(app, "quit", t!("quit").as_ref(), true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show_i, &add_drive_i, &settings_i, &quit_i])?;
 
@@ -325,6 +338,10 @@ pub fn run() {
 
             // Setup system tray
             setup_tray(app)?;
+
+            // Manage AppStateHandle immediately so commands can access it
+            // even before async initialization is complete.
+            app.manage(AppStateHandle);
 
             #[cfg(desktop)]
             if let Err(error) = app.deep_link().register("cloudreve") {

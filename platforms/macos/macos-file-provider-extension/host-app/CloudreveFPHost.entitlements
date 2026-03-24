@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 本地调试：先关闭沙箱，避免扩展连接 ~/.cloudreve/.../xpc.sock 被拦截 -->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+	<!-- 与扩展一致；缺少时 NSFileProviderManager 常报 -2001 / 底层 -2014（见 Apple 论坛与 SO） -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.cloudreve.desktop.fpe</string>
+	</array>
+</dict>
+</plist>

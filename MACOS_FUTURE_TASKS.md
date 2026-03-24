@@ -34,7 +34,7 @@
 - `scripts/smoke_mvp.sh`：聚合 `app-config` / `cloudreve-sync` /（macOS 下）`platforms-macos` 测试与 `cloudreve-desktop` 的 `cargo check`
 - `crates/app-config`：`LogLevel` / `AppConfig` 的 JSON 往返与部分字段默认、`from_str` 边界
 - `drive/remote_events.rs`：`BackoffState` 指数退避与 `reset` 单元测试（远端事件监听重连）
-- `crates/platforms/macos`：`ensure_mount_id` 稳定性、`escape_plist`、通知节流、`capabilities` 等单元测试
+- `platforms/macos`：`ensure_mount_id` 稳定性、`escape_plist`、通知节流、`capabilities` 等单元测试
 
 ### P2 仍待扩展（整体验收 / 高成本场景）
 

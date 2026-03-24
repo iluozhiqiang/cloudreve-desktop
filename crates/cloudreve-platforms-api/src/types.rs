@@ -121,3 +121,17 @@ pub struct VirtualPlaceholderSpec {
     pub dehydrate_on_update: bool,
     pub has_no_children: bool,
 }
+
+/// System-level per-item state for macOS Finder overlays (File Provider / FPE)
+/// as well as other future platform integrations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum FileProviderItemState {
+    #[serde(rename = "CloudOnly")]
+    CloudOnly,
+    #[serde(rename = "Syncing")]
+    Syncing,
+    #[serde(rename = "Synced")]
+    Synced,
+    #[serde(rename = "Error")]
+    Error,
+}

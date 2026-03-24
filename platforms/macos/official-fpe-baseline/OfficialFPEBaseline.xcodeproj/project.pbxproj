@@ -1,0 +1,513 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0019DC2AD26E49538A435094 /* OfficialFPHostApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09085CBF13FE49E18CBAB433 /* OfficialFPHostApp.swift */; };
+		0019DC2AD26E49538A435095 /* OfficialEnumerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0019DC2AD26E49538A435093 /* OfficialEnumerator.swift */; };
+		0019DC2AD26E49538A435096 /* OfficialItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5271BF4F5CB5454B94A9B7F8 /* OfficialItem.swift */; };
+		0019DC2AD26E49538A435097 /* OfficialFileProviderExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF46F6485B194ADE9473427F /* OfficialFileProviderExtension.swift */; };
+		5F4DA81958C34B5AB09C2E5B /* OfficialFPE.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = D159DA4AF8644A02AECB2986 /* OfficialFPE.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		A8F0E2D4C6B8A95183726151 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A8F0E2D4C6B8A95183726150 /* FileProvider.framework */; };
+		A8F0E2D4C6B8A95183726152 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A8F0E2D4C6B8A95183726150 /* FileProvider.framework */; };
+		AA01DC2AD26E49538A4350A1 /* OfficialFPHostDomain.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA01DC2AD26E49538A4350A0 /* OfficialFPHostDomain.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		5F4DA81958C34B5AB09C2E5C /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = CEDED0EAD202C455E9FAB42D0 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = F5AC881E60E1486D9DF32FCF;
+			remoteInfo = OfficialFPE;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		6F13E139B88447DE8FF3FC7A /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				5F4DA81958C34B5AB09C2E5B /* OfficialFPE.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		0019DC2AD26E49538A435093 /* OfficialEnumerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OfficialEnumerator.swift; sourceTree = "<group>"; };
+		09085CBF13FE49E18CBAB433 /* OfficialFPHostApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OfficialFPHostApp.swift; sourceTree = "<group>"; };
+		19FF9F0C417346E691EF6200 /* OfficialFPE.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = OfficialFPE.entitlements; sourceTree = "<group>"; };
+		46D232B1CB5D451DBC1B331D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		5271BF4F5CB5454B94A9B7F8 /* OfficialItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OfficialItem.swift; sourceTree = "<group>"; };
+		A8F0E2D4C6B8A95183726150 /* FileProvider.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = FileProvider.framework; path = System/Library/Frameworks/FileProvider.framework; sourceTree = SDKROOT; };
+		AA01DC2AD26E49538A4350A0 /* OfficialFPHostDomain.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OfficialFPHostDomain.swift; sourceTree = "<group>"; };
+		BF46F6485B194ADE9473427F /* OfficialFileProviderExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OfficialFileProviderExtension.swift; sourceTree = "<group>"; };
+		D159DA4AF8644A02AECB2986 /* OfficialFPE.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = OfficialFPE.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		E281FDAA6B654C25A621B2C3 /* OfficialFPHost.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = OfficialFPHost.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		FBE26C0328EC4CE3964B85A4 /* OfficialFPHost.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = OfficialFPHost.entitlements; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		638F333FEAAA451DB7D40BB2 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A8F0E2D4C6B8A95183726152 /* FileProvider.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B32FBCB7310443E68E4BE8C7 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A8F0E2D4C6B8A95183726151 /* FileProvider.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		3936E02092644582878918BA /* extension */ = {
+			isa = PBXGroup;
+			children = (
+				0019DC2AD26E49538A435093 /* OfficialEnumerator.swift */,
+				5271BF4F5CB5454B94A9B7F8 /* OfficialItem.swift */,
+				BF46F6485B194ADE9473427F /* OfficialFileProviderExtension.swift */,
+			);
+			path = extension;
+			sourceTree = "<group>";
+		};
+		3EA990EA2F7227200006E7DB /* Recovered References */ = {
+			isa = PBXGroup;
+			children = (
+				A8F0E2D4C6B8A95183726150 /* FileProvider.framework */,
+			);
+			name = "Recovered References";
+			sourceTree = "<group>";
+		};
+		A6C8B93D3DC44321B2A5FB7C = {
+			isa = PBXGroup;
+			children = (
+				B32FBCB7310443E68E4BE8C5 /* host-app */,
+				3936E02092644582878918BA /* extension */,
+				C2712E4F29E94397A0771A7E /* fpe */,
+				A6C8B93D3DC44321B2A5FB7D /* Products */,
+				3EA990EA2F7227200006E7DB /* Recovered References */,
+			);
+			sourceTree = "<group>";
+		};
+		A6C8B93D3DC44321B2A5FB7D /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				E281FDAA6B654C25A621B2C3 /* OfficialFPHost.app */,
+				D159DA4AF8644A02AECB2986 /* OfficialFPE.appex */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		B32FBCB7310443E68E4BE8C5 /* host-app */ = {
+			isa = PBXGroup;
+			children = (
+				09085CBF13FE49E18CBAB433 /* OfficialFPHostApp.swift */,
+				AA01DC2AD26E49538A4350A0 /* OfficialFPHostDomain.swift */,
+				FBE26C0328EC4CE3964B85A4 /* OfficialFPHost.entitlements */,
+			);
+			path = "host-app";
+			sourceTree = "<group>";
+		};
+		C2712E4F29E94397A0771A7E /* fpe */ = {
+			isa = PBXGroup;
+			children = (
+				46D232B1CB5D451DBC1B331D /* Info.plist */,
+				19FF9F0C417346E691EF6200 /* OfficialFPE.entitlements */,
+			);
+			path = fpe;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		06577601F206477D9A8D3E8E /* OfficialFPHost */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 06577601F206477D9A8D3E91 /* Build configuration list for PBXNativeTarget "OfficialFPHost" */;
+			buildPhases = (
+				06577601F206477D9A8D3E8F /* Sources */,
+				638F333FEAAA451DB7D40BB2 /* Frameworks */,
+				06577601F206477D9A8D3E90 /* Resources */,
+				6F13E139B88447DE8FF3FC7A /* Embed Foundation Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				5F4DA81958C34B5AB09C2E5E /* PBXTargetDependency */,
+			);
+			name = OfficialFPHost;
+			packageProductDependencies = (
+			);
+			productName = OfficialFPHost;
+			productReference = E281FDAA6B654C25A621B2C3 /* OfficialFPHost.app */;
+			productType = "com.apple.product-type.application";
+		};
+		F5AC881E60E1486D9DF32FCF /* OfficialFPE */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F5AC881E60E1486D9DF32FD2 /* Build configuration list for PBXNativeTarget "OfficialFPE" */;
+			buildPhases = (
+				F5AC881E60E1486D9DF32FD0 /* Sources */,
+				B32FBCB7310443E68E4BE8C7 /* Frameworks */,
+				F5AC881E60E1486D9DF32FD1 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = OfficialFPE;
+			packageProductDependencies = (
+			);
+			productName = OfficialFPE;
+			productReference = D159DA4AF8644A02AECB2986 /* OfficialFPE.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		CEDED0EAD202C455E9FAB42D0 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2600;
+				LastUpgradeCheck = 2630;
+				TargetAttributes = {
+					06577601F206477D9A8D3E8E = {
+						CreatedOnToolsVersion = 26.0;
+					};
+					F5AC881E60E1486D9DF32FCF = {
+						CreatedOnToolsVersion = 26.0;
+					};
+				};
+			};
+			buildConfigurationList = CEDED0EAD202C455E9FAB42D1 /* Build configuration list for PBXProject "OfficialFPEBaseline" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = A6C8B93D3DC44321B2A5FB7C;
+			productRefGroup = A6C8B93D3DC44321B2A5FB7D /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				06577601F206477D9A8D3E8E /* OfficialFPHost */,
+				F5AC881E60E1486D9DF32FCF /* OfficialFPE */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		06577601F206477D9A8D3E90 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F5AC881E60E1486D9DF32FD1 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		06577601F206477D9A8D3E8F /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0019DC2AD26E49538A435094 /* OfficialFPHostApp.swift in Sources */,
+				AA01DC2AD26E49538A4350A1 /* OfficialFPHostDomain.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F5AC881E60E1486D9DF32FD0 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0019DC2AD26E49538A435095 /* OfficialEnumerator.swift in Sources */,
+				0019DC2AD26E49538A435096 /* OfficialItem.swift in Sources */,
+				0019DC2AD26E49538A435097 /* OfficialFileProviderExtension.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		5F4DA81958C34B5AB09C2E5E /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = F5AC881E60E1486D9DF32FCF /* OfficialFPE */;
+			targetProxy = 5F4DA81958C34B5AB09C2E5C /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		06577601F206477D9A8D3E92 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = "host-app/OfficialFPHost.entitlements";
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = N92HAQL58M;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "Official FPE Baseline Host";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.cloudreve.desktop.fperef.host;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				REGISTER_APP_GROUPS = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		06577601F206477D9A8D3E93 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = "host-app/OfficialFPHost.entitlements";
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = N92HAQL58M;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "Official FPE Baseline Host";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.cloudreve.desktop.fperef.host;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				REGISTER_APP_GROUPS = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		CEDED0EAD202C455E9FAB42D2 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEAD_CODE_STRIPPING = YES;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = N92HAQL58M;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		CEDED0EAD202C455E9FAB42D3 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEAD_CODE_STRIPPING = YES;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = N92HAQL58M;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				SDKROOT = macosx;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+			};
+			name = Release;
+		};
+		F5AC881E60E1486D9DF32FD3 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = fpe/OfficialFPE.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
+				INFOPLIST_FILE = fpe/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Official FPE Baseline";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.cloudreve.desktop.fperef.host.fileprovider;
+				PRODUCT_NAME = OfficialFPE;
+				REGISTER_APP_GROUPS = YES;
+				SKIP_INSTALL = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		F5AC881E60E1486D9DF32FD4 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = fpe/OfficialFPE.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
+				INFOPLIST_FILE = fpe/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Official FPE Baseline";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.cloudreve.desktop.fperef.host.fileprovider;
+				PRODUCT_NAME = OfficialFPE;
+				REGISTER_APP_GROUPS = YES;
+				SKIP_INSTALL = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		06577601F206477D9A8D3E91 /* Build configuration list for PBXNativeTarget "OfficialFPHost" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				06577601F206477D9A8D3E92 /* Debug */,
+				06577601F206477D9A8D3E93 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		CEDED0EAD202C455E9FAB42D1 /* Build configuration list for PBXProject "OfficialFPEBaseline" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				CEDED0EAD202C455E9FAB42D2 /* Debug */,
+				CEDED0EAD202C455E9FAB42D3 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		F5AC881E60E1486D9DF32FD2 /* Build configuration list for PBXNativeTarget "OfficialFPE" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F5AC881E60E1486D9DF32FD3 /* Debug */,
+				F5AC881E60E1486D9DF32FD4 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = CEDED0EAD202C455E9FAB42D0 /* Project object */;
+}

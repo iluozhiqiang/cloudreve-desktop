@@ -530,12 +530,24 @@ impl Mount {
                         );
                     }
 
-                    self.command_tx
-                        .send(MountCommand::Sync {
-                            local_paths: sync_paths,
-                            mode,
-                        })
-                        .context("failed to send sync command")?;
+                    let use_fast_remote_delete = preferred_mode == Some(SyncMode::RemoteDelete)
+                        && mode == SyncMode::RemoteDelete
+                        && sync_paths == local_paths;
+
+                    if use_fast_remote_delete {
+                        self.command_tx
+                            .send(MountCommand::ApplyRemoteDeletes {
+                                paths: sync_paths,
+                            })
+                            .context("failed to send ApplyRemoteDeletes command")?;
+                    } else {
+                        self.command_tx
+                            .send(MountCommand::Sync {
+                                local_paths: sync_paths,
+                                mode,
+                            })
+                            .context("failed to send sync command")?;
+                    }
                     return Ok(());
                 } else {
                     tracing::debug!(

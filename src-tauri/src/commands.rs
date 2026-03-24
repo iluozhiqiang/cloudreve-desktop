@@ -2,9 +2,7 @@ use crate::AppStateHandle;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{Duration, Utc};
 use cloudreve_app_config::{ConfigManager, LogLevel};
-use cloudreve_sync::{
-    Credentials, DriveConfig, DriveInfo, PlatformCapabilities, StatusSummary,
-};
+use cloudreve_sync::{Credentials, DriveConfig, DriveInfo, PlatformCapabilities, StatusSummary};
 use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -83,8 +81,7 @@ fn verify_path_writable(path: &Path) -> CommandResult<()> {
     let probe_dir = if path.exists() {
         path.to_path_buf()
     } else {
-        nearest_existing_parent(path)
-            .ok_or_else(|| t!("localPathParentMissing").to_string())?
+        nearest_existing_parent(path).ok_or_else(|| t!("localPathParentMissing").to_string())?
     };
 
     let probe_path = probe_dir.join(format!(".cloudreve-write-test-{}", Uuid::new_v4()));
@@ -96,7 +93,11 @@ fn verify_path_writable(path: &Path) -> CommandResult<()> {
             if e.kind() == ErrorKind::PermissionDenied {
                 t!("localPathPermissionDenied").to_string()
             } else {
-                t!("localPathNotWritable", path = probe_dir.display().to_string()).to_string()
+                t!(
+                    "localPathNotWritable",
+                    path = probe_dir.display().to_string()
+                )
+                .to_string()
             }
         })?;
     let _ = fs::remove_file(&probe_path);
@@ -108,9 +109,7 @@ async fn validate_local_sync_path_impl(
     path: &str,
     drive_id: Option<&str>,
 ) -> CommandResult<LocalPathValidation> {
-    let app_state = state
-        .get()
-        .ok_or_else(|| "App not yet initialized".to_string())?;
+    let app_state = state.wait_for_ready().await;
     let normalized = normalize_local_path(path)?;
 
     if normalized.exists() && !normalized.is_dir() {
@@ -165,9 +164,7 @@ async fn validate_local_sync_path_impl(
 /// List all configured drives
 #[tauri::command]
 pub async fn list_drives(state: State<'_, AppStateHandle>) -> CommandResult<Vec<DriveConfig>> {
-    let app_state = state
-        .get()
-        .ok_or_else(|| "App not yet initialized".to_string())?;
+    let app_state = state.wait_for_ready().await;
     Ok(app_state.drive_manager.list_drives().await)
 }
 
@@ -191,9 +188,7 @@ pub async fn add_drive(
     state: State<'_, AppStateHandle>,
     config: AddDriveArgs,
 ) -> CommandResult<String> {
-    let app_state = state
-        .get()
-        .ok_or_else(|| "App not yet initialized".to_string())?;
+    let app_state = state.wait_for_ready().await;
 
     // Validate local_path for new drives (not for reauthorization)
     if config.drive_id.is_none() {
@@ -252,7 +247,7 @@ pub async fn add_drive(
         enabled: true,
         user_id: config.user_id,
         mount_id: None,
-        ignore_patterns: Vec::new(),
+        ignore_patterns: vec![".DS_Store".to_string()],
         extra: Default::default(),
     };
 
@@ -288,9 +283,7 @@ pub async fn remove_drive(
     state: State<'_, AppStateHandle>,
     drive_id: String,
 ) -> CommandResult<Option<DriveConfig>> {
-    let app_state = state
-        .get()
-        .ok_or_else(|| "App not yet initialized".to_string())?;
+    let app_state = state.wait_for_ready().await;
 
     let result = app_state
         .drive_manager
@@ -314,9 +307,7 @@ pub async fn get_sync_status(
     state: State<'_, AppStateHandle>,
     drive_id: String,
 ) -> CommandResult<serde_json::Value> {
-    let app_state = state
-        .get()
-        .ok_or_else(|| "App not yet initialized".to_string())?;
+    let app_state = state.wait_for_ready().await;
     app_state
         .drive_manager
         .get_sync_status(&drive_id)
@@ -330,9 +321,7 @@ pub async fn get_status_summary(
     state: State<'_, AppStateHandle>,
     drive_id: Option<String>,
 ) -> CommandResult<StatusSummary> {
-    let app_state = state
-        .get()
-        .ok_or_else(|| "App not yet initialized".to_string())?;
+    let app_state = state.wait_for_ready().await;
     app_state
         .drive_manager
         .get_status_summary(drive_id.as_deref())
@@ -343,9 +332,7 @@ pub async fn get_status_summary(
 /// Get all drives with their status information for the settings UI
 #[tauri::command]
 pub async fn get_drives_info(state: State<'_, AppStateHandle>) -> CommandResult<Vec<DriveInfo>> {
-    let app_state = state
-        .get()
-        .ok_or_else(|| "App not yet initialized".to_string())?;
+    let app_state = state.wait_for_ready().await;
     app_state
         .drive_manager
         .get_drives_info()
@@ -456,8 +443,8 @@ pub async fn show_file_in_explorer(
     }
 
     state
-        .get()
-        .ok_or_else(|| "App not yet initialized".to_string())?
+        .wait_for_ready()
+        .await
         .platform
         .desktop_integration()
         .open_in_file_manager(Path::new(&path))
@@ -485,7 +472,11 @@ pub async fn show_reauthorize_window(
 
 /// Show or create the add-drive window
 pub fn show_add_drive_window_impl(app: &AppHandle) {
-    show_drive_window_internal(app, "Add Drive", &get_url_with_lang("index.html/#/add-drive"));
+    show_drive_window_internal(
+        app,
+        "Add Drive",
+        &get_url_with_lang("index.html/#/add-drive"),
+    );
 }
 
 /// Show or create the reauthorize window for a specific drive
@@ -590,8 +581,8 @@ pub fn show_settings_window_impl(app: &AppHandle) {
 #[tauri::command]
 pub async fn get_auto_start_enabled(state: State<'_, AppStateHandle>) -> CommandResult<bool> {
     state
-        .get()
-        .ok_or_else(|| "App not yet initialized".to_string())?
+        .wait_for_ready()
+        .await
         .platform
         .auto_start()
         .is_enabled()
@@ -605,8 +596,8 @@ pub async fn set_auto_start(
     enabled: bool,
 ) -> CommandResult<bool> {
     let actual_state = state
-        .get()
-        .ok_or_else(|| "App not yet initialized".to_string())?
+        .wait_for_ready()
+        .await
         .platform
         .auto_start()
         .set_enabled(enabled)
@@ -623,11 +614,7 @@ pub async fn set_auto_start(
 pub async fn get_platform_capabilities(
     state: State<'_, AppStateHandle>,
 ) -> CommandResult<PlatformCapabilities> {
-    Ok(state
-        .get()
-        .ok_or_else(|| "App not yet initialized".to_string())?
-        .platform
-        .capabilities())
+    Ok(state.wait_for_ready().await.platform.capabilities())
 }
 
 /// Set notification settings for credential expiry
@@ -718,13 +705,12 @@ pub async fn set_language(app: AppHandle, language: Option<String>) -> CommandRe
         .map_err(|e| e.to_string())?;
 
     // Update rust_i18n locale
-    let locale = language.unwrap_or_else(|| {
-        sys_locale::get_locale().unwrap_or_else(|| String::from("en-US"))
-    });
+    let locale = language
+        .unwrap_or_else(|| sys_locale::get_locale().unwrap_or_else(|| String::from("en-US")));
     rust_i18n::set_locale(&locale);
 
     // Close main window to force reload with new language
-     // Check if window already exists
+    // Check if window already exists
     if let Some(window) = app.get_webview_window("main_popup") {
         let _ = window.close();
         let _ = window.destroy();
@@ -744,8 +730,8 @@ pub async fn open_log_folder(state: State<'_, AppStateHandle>) -> CommandResult<
     }
 
     state
-        .get()
-        .ok_or_else(|| "App not yet initialized".to_string())?
+        .wait_for_ready()
+        .await
         .platform
         .desktop_integration()
         .open_in_file_manager(log_dir.as_path())

@@ -5,7 +5,7 @@ use crate::{
         sync::{GroupedFsEvents, SyncMode},
         utils::{cr_uri_for_fs_event_path, local_path_to_cr_uri, local_state_matches_inventory},
     },
-    inventory::ConflictState,
+    inventory::{ConflictState, TaskStatus},
     platform_provider,
     tasks::TaskPayload,
 };
@@ -27,7 +27,7 @@ use notify_debouncer_full::notify::{
     Event, EventKind,
     event::{CreateKind, ModifyKind, RemoveKind, RenameMode},
 };
-use cloudreve_platforms_api::{FetchDataRequest, LocalAvailability, VirtualFileMode};
+use cloudreve_platforms_api::{FetchDataRequest, FileProviderItemState, LocalAvailability, VirtualFileMode, VirtualFileState};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -106,12 +106,20 @@ pub enum MountCommand {
         request: FetchDataRequest,
         response: Sender<Result<()>>,
     },
+    GetItemState {
+        path: PathBuf,
+        response: Sender<Result<FileProviderItemState>>,
+    },
     ProcessFsEvents {
         events: GroupedFsEvents,
     },
     Sync {
         local_paths: Vec<PathBuf>,
         mode: SyncMode,
+    },
+    /// Remote-delete SSE: delete local files without fetching remote metadata or building a full sync plan.
+    ApplyRemoteDeletes {
+        paths: Vec<PathBuf>,
     },
     Rename {
         source: PathBuf,
@@ -352,6 +360,75 @@ impl Mount {
             local_path: path.clone(),
             remote_path: uri.clone(),
         })
+    }
+
+    /// Return per-item state for Finder/File Provider overlays.
+    ///
+    /// The mapping is aligned with `MACOS_VALIDATION_CHECKLIST.md`:
+    /// - CloudOnly: local not materialized (virtual placeholder or missing) with no active/failed/conflict
+    /// - Syncing: pending/running task exists, or file is partially on disk
+    /// - Synced: local materialized with no active/failed/conflict
+    /// - Error: failed task exists or conflict_state is set
+    pub async fn get_item_state(&self, path: PathBuf) -> Result<FileProviderItemState> {
+        let path_str = path.to_string_lossy().to_string();
+        let prefix = format!("{}{}", path_str, std::path::MAIN_SEPARATOR);
+
+        // 1) Task-driven states
+        let recent_tasks = self
+            .inventory
+            .query_recent_tasks(Some(&self.id))
+            .context("failed to query recent tasks")?;
+
+        let mut has_active_task = false;
+        for task in &recent_tasks.active {
+            if task.local_path == path_str || task.local_path.starts_with(&prefix) {
+                has_active_task = true;
+                break;
+            }
+        }
+
+        if has_active_task {
+            return Ok(FileProviderItemState::Syncing);
+        }
+
+        let mut has_failed_task = false;
+        for task in &recent_tasks.finished {
+            if task.local_path == path_str || task.local_path.starts_with(&prefix) {
+                if task.status == TaskStatus::Failed || task.error.is_some() {
+                    has_failed_task = true;
+                    break;
+                }
+            }
+        }
+
+        // 2) Conflict-driven states
+        let conflict_state = self
+            .inventory
+            .query_by_path(&path_str)?
+            .and_then(|meta| meta.conflict_state);
+
+        if has_failed_task || conflict_state.is_some() {
+            return Ok(FileProviderItemState::Error);
+        }
+
+        // 3) Local materialization states (placeholder vs hydrated)
+        let local_state: VirtualFileState = match platform_provider() {
+            Ok(platform) => platform
+                .virtual_file_ops()
+                .query_local_state(path.as_path())
+                .unwrap_or_else(|_| VirtualFileState::missing()),
+            Err(_) => VirtualFileState::missing(),
+        };
+
+        if local_state.exists && local_state.is_partially_on_disk() {
+            return Ok(FileProviderItemState::Syncing);
+        }
+
+        if local_state.exists && !local_state.is_virtual_placeholder() {
+            return Ok(FileProviderItemState::Synced);
+        }
+
+        Ok(FileProviderItemState::CloudOnly)
     }
 
     pub async fn generate_thumbnail(&self, path: PathBuf) -> Result<Bytes> {

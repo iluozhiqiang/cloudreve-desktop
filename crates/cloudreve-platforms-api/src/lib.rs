@@ -9,4 +9,5 @@ pub use traits::{
 pub use types::{
     DesktopIntegrationCapabilities, LocalAvailability, PlaceholderEntry, PlatformCapabilities,
     PlatformKind, VirtualFileMetadata, VirtualFileMode, VirtualFileState, VirtualPlaceholderSpec,
+    FileProviderItemState,
 };

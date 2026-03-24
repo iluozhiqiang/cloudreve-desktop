@@ -422,6 +422,72 @@ impl Mount {
         aggregate_error.into_result()
     }
 
+    /// Fast path for remote-delete push events: skips `fetch_remote_file_infos`, local/inventory
+    /// gathering, and `build_sync_plan` — only runs delete actions (same as `SyncMode::RemoteDelete`
+    /// when the target paths are exactly the remote-deleted entries).
+    pub async fn apply_remote_deletes_fast(&self, paths: Vec<PathBuf>) -> Result<()> {
+        let _sync_guard = self.sync_lock.lock().await;
+
+        if paths.is_empty() {
+            return Ok(());
+        }
+
+        let mut aggregate_error =
+            SyncAggregateError::new(format!("Mount {} apply_remote_deletes_fast", self.id));
+
+        let mut actions: Vec<SyncAction> = Vec::with_capacity(paths.len());
+        for path in paths {
+            let local = match crate::platform_provider()?
+                .virtual_file_ops()
+                .query_local_state(&path)
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "drive::sync",
+                        id = %self.id,
+                        path = %path.display(),
+                        error = ?e,
+                        "apply_remote_deletes_fast: query_local_state failed"
+                    );
+                    continue;
+                }
+            };
+
+            if !local.exists {
+                tracing::debug!(
+                    target: "drive::sync",
+                    id = %self.id,
+                    path = %path.display(),
+                    "apply_remote_deletes_fast: path already absent"
+                );
+                continue;
+            }
+
+            actions.push(SyncAction::DeleteLocalAndInventory {
+                path,
+                skip_if_not_empty: local.is_directory(),
+            });
+        }
+
+        if actions.is_empty() {
+            return Ok(());
+        }
+
+        tracing::info!(
+            target: "drive::sync",
+            id = %self.id,
+            count = actions.len(),
+            "apply_remote_deletes_fast"
+        );
+
+        self.process_sync_plan_actions_list(&actions, &mut aggregate_error)
+            .await?;
+
+        drop(_sync_guard);
+        aggregate_error.into_result()
+    }
+
     async fn sync_group(
         &self,
         parent: &PathBuf,

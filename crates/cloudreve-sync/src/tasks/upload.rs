@@ -15,6 +15,7 @@ use cloudreve_api::{
     error::ErrorCode,
     models::explorer::{CreateFileService, FileResponse, FileUpdateService, file_type},
 };
+use cloudreve_platforms_api::VirtualFileMode;
 use dashmap::DashMap;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -109,7 +110,15 @@ impl<'a> UploadTask<'a> {
             return Ok(());
         }
 
-        if placeholder_file.local_file_info.is_in_sync()
+        // `VirtualFileState::in_sync` comes from the platform (e.g. Win CFAPI / macOS markers).
+        // On macOS simple sync (`VirtualFileMode::None`), plain files have no marker and incorrectly
+        // report `in_sync == true`, which would skip the real upload while still completing the task.
+        let trust_platform_in_sync_skip = platform_provider()
+            .map(|p| p.virtual_files().mode() != VirtualFileMode::None)
+            .unwrap_or(false);
+
+        if trust_platform_in_sync_skip
+            && placeholder_file.local_file_info.is_in_sync()
             && !placeholder_file.local_file_info.is_directory()
         {
             info!(

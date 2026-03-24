@@ -8,8 +8,8 @@ use std::{
 use anyhow::Result;
 
 use crate::types::{
-    LocalAvailability, PlaceholderEntry, PlatformCapabilities, VirtualFileMetadata,
-    VirtualFileMode, VirtualFileState, VirtualPlaceholderSpec,
+    FileProviderItemState, LocalAvailability, PlaceholderEntry, PlatformCapabilities,
+    VirtualFileMetadata, VirtualFileMode, VirtualFileState, VirtualPlaceholderSpec,
 };
 
 pub trait MountSession: Send + Sync {
@@ -56,6 +56,8 @@ pub struct MountRegistrationContext {
 pub trait MountedDriveCallback: Send + Sync {
     fn fetch_data(&self, request: FetchDataRequest) -> Result<()>;
     fn fetch_placeholders(&self, path: PathBuf) -> Result<Vec<PlaceholderEntry>>;
+    /// Query system-visible per-item state for Finder/File Provider overlays.
+    fn get_item_state(&self, path: PathBuf) -> Result<FileProviderItemState>;
     fn rename(&self, source: PathBuf, target: PathBuf) -> Result<()>;
     fn renamed(&self, source: PathBuf, destination: PathBuf);
 }

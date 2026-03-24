@@ -38,7 +38,7 @@ urlencoding = "2.1"
 # Main sync service crate
 cloudreve-app-config = { path = "../crates/app-config" }
 cloudreve-sync = { path = "../crates/cloudreve-sync" }
-cloudreve-platforms-api = { path = "../crates/platforms/api" }
+cloudreve-platforms-api = { path = "../crates/cloudreve-platforms-api" }
 
 tauri-plugin-frame = "1.1.6"
 tauri-plugin-http = "2"
@@ -56,10 +56,10 @@ features = ["Foundation", "ApplicationModel"]
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
-cloudreve-platforms-macos = { path = "../crates/platforms/macos" }
+cloudreve-platforms-macos = { path = "../platforms/macos" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-cloudreve-platforms-windows = { path = "../crates/platforms/windows" }
+cloudreve-platforms-windows = { path = "../platforms/windows" }
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-positioner = { version = "2.3.1", features = ["tray-icon"] }

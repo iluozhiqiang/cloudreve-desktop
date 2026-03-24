@@ -22,3 +22,10 @@ Cargo.lock
 /debug/
 dist/
 package/*.exe
+
+# macOS Swift / Xcode（File Provider 等本地编译目录，勿提交）
+platforms/macos/macos-file-provider-extension/build/
+platforms/macos/official-fpe-baseline/build/
+**/DerivedData/
+**/xcuserdata/
+*.xcuserstate

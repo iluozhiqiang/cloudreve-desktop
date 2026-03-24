@@ -167,10 +167,10 @@ dist/
 │   ├── app-config/               # Shared app configuration loading and persistence
 │   ├── cloudreve-sync/           # Platform-agnostic sync core and drive orchestration
 │   ├── cloudreve-api/            # REST client for Cloudreve server
-│   └── platforms/
-│       ├── api/                  # Minimal cross-platform interfaces used by sync core
-│       ├── macos/                # macOS platform stub / future File Provider entry
-│       └── windows/              # Windows implementations (cfapi, shell, notif)
+│   └── cloudreve-platforms-api/ # Traits + types shared by sync and platform crates
+├── platforms/
+│   ├── macos/                    # macOS Rust provider; native FPE / baseline live under this tree
+│   └── windows/                  # Windows implementations (cfapi, shell, notif)
 ├── ui/                  # React frontend (Vite + MUI)
 ├── package/             # MSIX packaging assets
 ├── dev-install.ps1      # Dev build + register script

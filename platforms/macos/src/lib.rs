@@ -9,16 +9,38 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use cloudreve_app_config::ConfigManager;
+use sha2::{Digest, Sha256};
 use cloudreve_platforms_api::{
     AutoStartProvider, DesktopIntegration, LocalAvailability, MountRegistrationContext,
     MountSession, MountedDriveCallback, PlatformCapabilities, PlatformKind, PlatformMountProvider,
     PlatformProvider, VirtualFileMode, VirtualFileOps, VirtualFileState, VirtualPlaceholderSpec,
     VirtualFileProvider,
 };
+mod file_provider_ipc;
 use filetime::{FileTime, set_file_mtime};
 
 const NOTIFICATION_COOLDOWN_SECS: u64 = 15;
 const MACOS_AUTOSTART_LABEL: &str = "xyz.cloudreve.desktop";
+
+/// 默认走最简单同步：`VirtualFileMode::None`，不启动 FPE Unix IPC。
+/// 需要 File Provider / Finder 集成时再设 `CLOUDREVE_MACOS_FPE=1`（或 `true` / `yes` / `on`）。
+fn macos_fpe_ipc_enabled() -> bool {
+    match std::env::var("CLOUDREVE_MACOS_FPE") {
+        Ok(v) => {
+            let v = v.to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes" || v == "on"
+        }
+        Err(_) => false,
+    }
+}
+
+fn macos_virtual_file_mode() -> VirtualFileMode {
+    if cfg!(target_os = "macos") && macos_fpe_ipc_enabled() {
+        VirtualFileMode::FileProvider
+    } else {
+        VirtualFileMode::None
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct MacosPlatformProvider;
@@ -190,12 +212,58 @@ fn query_children_present(path: &Path) -> bool {
         .is_some()
 }
 
+fn placeholder_marker_base_dir() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").context("HOME environment variable is not set")?;
+    Ok(PathBuf::from(home)
+        .join(".cloudreve")
+        .join("macos-file-provider")
+        .join("markers"))
+}
+
+fn placeholder_marker_path(target_path: &Path) -> Result<PathBuf> {
+    let base_dir = placeholder_marker_base_dir()?;
+    let input = target_path.to_string_lossy();
+    let hash = Sha256::digest(input.as_bytes());
+    let hash_hex = format!("{:x}", hash);
+    Ok(base_dir.join(format!("{hash_hex}.marker")))
+}
+
+fn write_placeholder_marker(target_path: &Path, in_sync: bool) -> Result<()> {
+    let marker_path = placeholder_marker_path(target_path)?;
+    if let Some(parent) = marker_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(marker_path, if in_sync { b"1" } else { b"0" })?;
+    Ok(())
+}
+
+fn placeholder_marker_exists(target_path: &Path) -> bool {
+    placeholder_marker_path(target_path).map(|p| p.exists()).unwrap_or(false)
+}
+
+fn read_placeholder_marker_in_sync(target_path: &Path) -> bool {
+    placeholder_marker_path(target_path)
+        .ok()
+        .and_then(|p| fs::read(p).ok())
+        .map(|v| v.first().copied() == Some(b'1'))
+        .unwrap_or(false)
+}
+
+fn clear_placeholder_marker(target_path: &Path) -> Result<()> {
+    if let Ok(marker_path) = placeholder_marker_path(target_path) {
+        if marker_path.exists() {
+            let _ = fs::remove_file(marker_path);
+        }
+    }
+    Ok(())
+}
+
 impl PlatformProvider for MacosPlatformProvider {
     fn capabilities(&self) -> PlatformCapabilities {
         PlatformCapabilities {
             platform: PlatformKind::Macos,
-            virtual_file_mode: VirtualFileMode::None,
-            sync_root_registration: false,
+            virtual_file_mode: macos_virtual_file_mode(),
+            sync_root_registration: cfg!(target_os = "macos"),
             auto_start: true,
             desktop_integration: cloudreve_platforms_api::DesktopIntegrationCapabilities {
                 notifications: true,
@@ -228,7 +296,7 @@ impl PlatformProvider for MacosPlatformProvider {
 
 impl PlatformMountProvider for MacosPlatformProvider {
     fn is_supported(&self) -> Result<bool> {
-        Ok(false)
+        Ok(cfg!(target_os = "macos"))
     }
 
     fn ensure_mount_id(
@@ -243,15 +311,26 @@ impl PlatformMountProvider for MacosPlatformProvider {
     fn connect_mount(
         &self,
         context: &MountRegistrationContext,
-        _handler: Arc<dyn MountedDriveCallback>,
+        handler: Arc<dyn MountedDriveCallback>,
     ) -> Result<Box<dyn MountSession>> {
-        tracing::debug!(
+        if !macos_fpe_ipc_enabled() {
+            tracing::info!(
+                target: "platforms::macos",
+                mount_id = %context.mount_id,
+                "File Provider IPC off (simple sync); set CLOUDREVE_MACOS_FPE=1 to enable"
+            );
+            let _ = handler;
+            return Ok(Box::new(NoopMountSession));
+        }
+
+        tracing::info!(
             target: "platforms::macos",
             mount_id = %context.mount_id,
             sync_path = %context.sync_path.display(),
-            "Using no-op mount session for local-sync mode"
+            "Starting File Provider IPC server for mount"
         );
-        Ok(Box::new(NoopMountSession))
+
+        file_provider_ipc::register_handler_for_mount(context.mount_id.clone(), handler)
     }
 
     fn unregister_mount(&self, _mount_id: &str) -> Result<()> {
@@ -261,28 +340,61 @@ impl PlatformMountProvider for MacosPlatformProvider {
 
 impl VirtualFileProvider for MacosPlatformProvider {
     fn mode(&self) -> VirtualFileMode {
-        VirtualFileMode::None
+        macos_virtual_file_mode()
     }
 }
 
 impl VirtualFileOps for MacosPlatformProvider {
     fn query_local_state(&self, path: &Path) -> Result<VirtualFileState> {
         Ok(match fs::metadata(path) {
-            Ok(meta) => VirtualFileState {
-                exists: true,
-                is_directory: meta.is_dir(),
-                file_size: Some(meta.len()),
-                last_modified_unix: meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64),
-                is_virtual_placeholder: false,
-                in_sync: true,
-                partially_on_disk: false,
-                local_availability: LocalAvailability::AlwaysLocal,
-                children_present: meta.is_dir() && query_children_present(path),
-            },
+            Ok(meta) => {
+                let is_dir = meta.is_dir();
+                let children_present = is_dir && query_children_present(path);
+
+                let marker_exists = placeholder_marker_exists(path);
+                let mut is_virtual_placeholder = marker_exists;
+
+                // If a placeholder marker still exists but local content was actually materialized,
+                // best-effort treat it as hydrated and clear the marker.
+                if marker_exists && !is_dir && meta.len() > 0 {
+                    is_virtual_placeholder = false;
+                    let _ = clear_placeholder_marker(path);
+                }
+
+                // For directories, treat "placeholder dir" as virtual only when it looks empty.
+                if is_virtual_placeholder && is_dir && children_present {
+                    is_virtual_placeholder = false;
+                }
+
+                // Without a marker, treat as not server-synced (simple sync / plain files).
+                let in_sync = if marker_exists {
+                    read_placeholder_marker_in_sync(path)
+                } else {
+                    false
+                };
+
+                let local_availability = if is_virtual_placeholder {
+                    LocalAvailability::Unspecified
+                } else {
+                    LocalAvailability::AlwaysLocal
+                };
+
+                VirtualFileState {
+                    exists: true,
+                    is_directory: is_dir,
+                    file_size: Some(meta.len()),
+                    last_modified_unix: meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64),
+                    is_virtual_placeholder,
+                    in_sync,
+                    partially_on_disk: false,
+                    local_availability,
+                    children_present,
+                }
+            }
             Err(_) => VirtualFileState::missing(),
         })
     }
@@ -293,25 +405,50 @@ impl VirtualFileOps for MacosPlatformProvider {
                 format!("failed to create parent directory {}", parent.display())
             })?;
         }
+        let existing_state = self
+            .query_local_state(&spec.target_path)
+            .unwrap_or_else(|_| VirtualFileState::missing());
+
         if spec.is_directory {
             fs::create_dir_all(&spec.target_path).with_context(|| {
                 format!("failed to create directory {}", spec.target_path.display())
             })?;
-        } else if !spec.target_path.exists() {
-            OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&spec.target_path)
-                .with_context(|| {
-                    format!("failed to create file {}", spec.target_path.display())
-                })?;
+        } else {
+            if !spec.target_path.exists() {
+                OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&spec.target_path)
+                    .with_context(|| {
+                        format!("failed to create file {}", spec.target_path.display())
+                    })?;
+            }
+
+            // Converting hydrated content into a placeholder is expected when we (re)create
+            // the placeholder during remote invalidation / updates.
+            if spec.overwrite && existing_state.exists && !existing_state.is_virtual_placeholder {
+                OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&spec.target_path)
+                    .with_context(|| {
+                        format!("failed to truncate file {}", spec.target_path.display())
+                    })?;
+            }
         }
+
+        // Always mark as placeholder for File Provider mode, so Finder overlay can distinguish
+        // CloudOnly vs Synced.
+        write_placeholder_marker(&spec.target_path, spec.mark_in_sync)?;
+
         apply_modified_time(&spec.target_path, spec.metadata.modified_unix)?;
         Ok(())
     }
 
     fn remove_placeholder(&self, path: &Path) -> Result<()> {
+        let _ = clear_placeholder_marker(path);
+
         if path.is_dir() {
             fs::remove_dir_all(path)?;
         } else if path.exists() {
@@ -320,19 +457,41 @@ impl VirtualFileOps for MacosPlatformProvider {
         Ok(())
     }
 
-    fn mark_in_sync(&self, _path: &Path, _in_sync: bool) -> Result<()> {
+    fn mark_in_sync(&self, path: &Path, in_sync: bool) -> Result<()> {
+        // Ensure marker exists so query_local_state() can reflect the flag.
+        if placeholder_marker_exists(path) {
+            write_placeholder_marker(path, in_sync)?;
+        }
         Ok(())
     }
 
     fn hydrate_file(&self, _path: &Path, _range: std::ops::Range<u64>) -> Result<()> {
+        // When core explicitly requests hydration, drop the placeholder marker so Finder overlay
+        // can flip to Synced.
+        clear_placeholder_marker(_path)?;
         Ok(())
     }
 
     fn dehydrate_file(&self, _path: &Path, _range: std::ops::Range<u64>) -> Result<()> {
+        // When core explicitly requests dehydrate, restore the placeholder marker (and best-effort
+        // truncate local content so query_local_state() doesn't auto-detect as hydrated).
+        if _path.exists() && _path.is_file() {
+            let _ = OpenOptions::new().write(true).truncate(true).open(_path);
+        }
+        write_placeholder_marker(_path, true)?;
         Ok(())
     }
 
     fn set_local_availability(&self, _path: &Path, _availability: LocalAvailability) -> Result<()> {
+        match _availability {
+            LocalAvailability::AlwaysLocal => {
+                clear_placeholder_marker(_path)?;
+            }
+            LocalAvailability::OnlineOnly => {
+                write_placeholder_marker(_path, true)?;
+            }
+            LocalAvailability::Unspecified => {}
+        }
         Ok(())
     }
 
@@ -416,7 +575,6 @@ impl AutoStartProvider for MacosPlatformProvider {
 mod tests {
     use super::*;
     use std::path::Path;
-    use std::sync::Mutex;
     use std::time::Duration;
 
     #[test]
@@ -476,7 +634,8 @@ mod tests {
         let p = MacosPlatformProvider::new();
         let c = p.capabilities();
         assert_eq!(c.platform, PlatformKind::Macos);
-        assert_eq!(c.virtual_file_mode, VirtualFileMode::None);
+        let expected = macos_virtual_file_mode();
+        assert_eq!(c.virtual_file_mode, expected);
         assert!(c.auto_start);
     }
 }

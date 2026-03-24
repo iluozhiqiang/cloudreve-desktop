@@ -9,7 +9,9 @@ use crate::{
     inventory::{InventoryDb, MetadataEntry},
 };
 use anyhow::{Context, Result};
-use cloudreve_platforms_api::{FetchDataRequest, MountedDriveCallback, PlaceholderEntry};
+use cloudreve_platforms_api::{
+    FetchDataRequest, FileProviderItemState, MountedDriveCallback, PlaceholderEntry,
+};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
@@ -53,6 +55,21 @@ impl MountedDriveCallback for MountedDriveCallbackAdapter {
     fn fetch_placeholders(&self, path: PathBuf) -> Result<Vec<PlaceholderEntry>> {
         let files = self.fetch_placeholder_result(path)?;
         Ok(self.build_placeholder_entries(&files))
+    }
+
+    fn get_item_state(&self, path: PathBuf) -> Result<FileProviderItemState> {
+        let (response_tx, response_rx) = oneshot::channel();
+        let command = MountCommand::GetItemState {
+            path,
+            response: response_tx,
+        };
+        self.command_tx
+            .send(command)
+            .context("Failed to send GetItemState command")?;
+
+        response_rx
+            .blocking_recv()
+            .context("GetItemState response channel closed")?
     }
 
     fn rename(&self, source: PathBuf, target: PathBuf) -> Result<()> {

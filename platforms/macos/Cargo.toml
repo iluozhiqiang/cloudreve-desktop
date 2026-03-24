@@ -1,0 +1,17 @@
+[package]
+name = "cloudreve-platforms-macos"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+cloudreve-app-config = { path = "../../crates/app-config" }
+cloudreve-platforms-api = { path = "../../crates/cloudreve-platforms-api" }
+filetime = "0.2"
+showfile = "0.1"
+tracing = "0.1"
+tokio = { version = "1.35", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+base64 = "0.21"

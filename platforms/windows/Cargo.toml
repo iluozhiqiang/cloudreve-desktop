@@ -7,8 +7,8 @@ edition = "2021"
 anyhow = "1.0"
 base64 = "0.21"
 bytes = "1"
-cloudreve-app-config = { path = "../../app-config" }
-cloudreve-platforms-api = { path = "../api" }
+cloudreve-app-config = { path = "../../crates/app-config" }
+cloudreve-platforms-api = { path = "../../crates/cloudreve-platforms-api" }
 cloudreve-platforms-windows-cfapi = { path = "./cfapi" }
 dark-light = "2.0.0"
 nt-time = "0.8.0"
