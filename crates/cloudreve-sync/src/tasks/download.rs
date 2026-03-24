@@ -18,7 +18,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use cloudreve_api::{Client, api::ExplorerApi, models::explorer::FileURLService};
+use cloudreve_api::{Client, api::ExplorerApi};
 use dashmap::DashMap;
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
@@ -45,6 +45,22 @@ fn build_download_temp_path(local_path: &PathBuf, task_id: &str) -> Result<PathB
         .parent()
         .context("failed to get local parent directory for temp path")?;
     Ok(parent.join(format!(".{file_name}.cloudreve-download-{task_id}.tmp")))
+}
+
+fn validate_downloaded_bytes(actual_len: u64, declared: u64, inv_sz: u64) -> Result<()> {
+    if actual_len == 0 && declared > 0 {
+        anyhow::bail!(
+            "downloaded 0 bytes but server reported {} bytes; network or storage error",
+            declared
+        );
+    }
+    if actual_len == 0 && declared == 0 && inv_sz > 0 {
+        anyhow::bail!(
+            "downloaded 0 bytes while inventory expected {} bytes; upload may still be finalizing",
+            inv_sz
+        );
+    }
+    Ok(())
 }
 
 /// Progress tracker for download operations.
@@ -332,18 +348,18 @@ impl<'a> DownloadTask<'a> {
         let file_size = file_info.size as u64;
         self.remote_file_info = Some(file_info);
 
-        // Get download URL from server using inventory metadata for entity validation
-        let mut request = FileURLService::default();
-        request.uris.push(uri.clone());
-        if self.remote_file_info.as_ref().map(|f|f.primary_entity.is_some()).unwrap_or(false) {
-            request.entity = self.remote_file_info.as_ref().unwrap().primary_entity.clone();
-        }
+        let entity = self
+            .remote_file_info
+            .as_ref()
+            .and_then(|f| f.primary_entity.clone());
 
-        let entity_url_res = self
-            .cr_client
-            .get_file_url(&request)
-            .await
-            .context("failed to get file url")?;
+        let entity_url_res = crate::drive::utils::get_file_url_with_entity_fallback(
+            &self.cr_client,
+            &uri,
+            entity,
+        )
+        .await
+        .context("failed to get file url")?;
 
         let download_url = entity_url_res
             .urls
@@ -382,6 +398,29 @@ impl<'a> DownloadTask<'a> {
 
         match download_result {
             Ok(()) => {
+                let actual_len = std::fs::metadata(&temp_path)
+                    .context("failed to stat temp download file")?
+                    .len();
+
+                if let Some(fr) = self.remote_file_info.as_mut() {
+                    if actual_len > 0 && fr.size == 0 {
+                        fr.size = actual_len as i64;
+                    }
+                }
+
+                let declared = self
+                    .remote_file_info
+                    .as_ref()
+                    .map(|f| f.size.max(0) as u64)
+                    .unwrap_or(0);
+                let inv_sz = self
+                    .inventory_meta
+                    .as_ref()
+                    .map(|m| m.size.max(0) as u64)
+                    .unwrap_or(0);
+
+                validate_downloaded_bytes(actual_len, declared, inv_sz)?;
+
                 // Report final progress
                 let final_update = tracker.create_update();
                 reporter.on_progress(&final_update);

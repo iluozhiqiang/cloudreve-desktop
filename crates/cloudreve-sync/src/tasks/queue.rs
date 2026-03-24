@@ -220,8 +220,8 @@ impl TaskQueue {
     /// 2. Abort running tasks that match the path
     /// 3. Tasks in the channel queue will check their status upon scheduling and exit early
     ///
-    /// Returns the number of tasks that were cancelled.
-    pub async fn cancel_by_path(&self, path: impl AsRef<std::path::Path>) -> Result<usize> {
+    /// Returns the task IDs that were marked cancelled in the inventory.
+    pub async fn cancel_by_path(&self, path: impl AsRef<std::path::Path>) -> Result<Vec<String>> {
         let path_str = path.as_ref().to_string_lossy().to_string();
 
         info!(
@@ -275,7 +275,7 @@ impl TaskQueue {
             );
         }
 
-        Ok(cancelled_count)
+        Ok(cancelled_ids)
     }
 
     async fn spawn_dispatcher(self: &Arc<Self>, command_rx: UnboundedReceiver<QueueCommand>) {

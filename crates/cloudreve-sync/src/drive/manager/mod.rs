@@ -4,12 +4,12 @@ mod types;
 
 pub use types::*;
 
-use crate::drive::commands::ManagerCommand;
+use crate::drive::commands::{ConflictAction, ManagerCommand};
 use crate::drive::mounts::{Credentials, DriveConfig, Mount};
 use crate::EventBroadcaster;
 use crate::inventory::InventoryDb;
 use crate::platform_provider;
-use crate::tasks::TaskProgress;
+use crate::tasks::{TaskKind, TaskPayload, TaskProgress};
 use anyhow::{Context, Result};
 use cloudreve_platforms_api::PlatformProvider;
 use std::collections::HashMap;
@@ -413,6 +413,94 @@ impl DriveManager {
             "last_sync": null,
             "files_synced": 0,
         }))
+    }
+
+    /// Resolve a sync conflict for a local path (`file_id` 0 uses `path` only; same as Windows toast actions).
+    ///
+    /// `action` must be one of: `keep_remote`, `overwrite_remote`, `save_as_new`.
+    pub async fn resolve_sync_conflict(
+        &self,
+        drive_id: &str,
+        local_path: &str,
+        action: &str,
+    ) -> Result<()> {
+        let conflict_action = ConflictAction::from_str(action.trim()).ok_or_else(|| {
+            anyhow::anyhow!("invalid conflict action (expected keep_remote | overwrite_remote | save_as_new)")
+        })?;
+        let mount = self
+            .get_drive(drive_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("drive not found"))?;
+        mount
+            .resolve_conflict(conflict_action, 0, local_path.to_string())
+            .await
+    }
+
+    /// Enqueue a new upload or download for `local_path` after a failure (or to retry). Path must lie under the drive sync root.
+    pub async fn retry_sync_task(
+        &self,
+        drive_id: &str,
+        local_path: &str,
+        task_type: &str,
+    ) -> Result<()> {
+        let mount = self
+            .get_drive(drive_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("drive not found"))?;
+        let sync_path = mount.get_sync_path().await;
+        let path = PathBuf::from(local_path);
+        let target_path = match path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => path.clone(),
+        };
+        let sync_root = match sync_path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => sync_path,
+        };
+        if !target_path.starts_with(&sync_root) {
+            return Err(anyhow::anyhow!(
+                "path is not under this drive's sync folder"
+            ));
+        }
+        let kind = TaskKind::from_str(task_type.trim()).ok_or_else(|| {
+            anyhow::anyhow!("invalid task type (expected upload | download)")
+        })?;
+        let payload = match kind {
+            TaskKind::Upload => TaskPayload::upload(path.clone()),
+            TaskKind::Download => TaskPayload::download(path.clone()),
+        };
+
+        // Clear any pending/running rows for this path so enqueue is not blocked by
+        // insert_task_if_not_exist (stuck Running after a timeout is a common case).
+        let cancelled_ids = mount
+            .task_queue
+            .cancel_by_path(&path)
+            .await
+            .context("Failed to cancel in-flight tasks before retry")?;
+
+        // Remove those rows so recent-task dedupe does not show "Cancelled" instead of the prior Failed row.
+        for id in cancelled_ids {
+            mount
+                .inventory
+                .delete_task(&id)
+                .with_context(|| format!("Failed to delete cancelled task {id} before retry"))?;
+        }
+
+        mount
+            .inventory
+            .delete_failed_or_cancelled_tasks_for_path_kind(
+                drive_id,
+                local_path.trim(),
+                kind.as_str(),
+            )
+            .context("Failed to clear finished failure rows before retry")?;
+
+        mount
+            .task_queue
+            .enqueue(payload)
+            .await
+            .context("Failed to enqueue retry task")?;
+        Ok(())
     }
 
     /// Get a summary of the current status including all drives and recent tasks.

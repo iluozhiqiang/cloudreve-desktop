@@ -4,7 +4,9 @@ use crate::{
     drive::{
         commands::GetPlacehodlerResult,
         commands::MountCommand,
-        sync::{cloud_file_to_metadata_entry, cloud_file_to_placeholder_entry, is_symbolic_link},
+        sync::{
+            cloud_file_to_metadata_entry, cloud_file_to_placeholder_entry_merged, is_symbolic_link,
+        },
     },
     inventory::{InventoryDb, MetadataEntry},
 };
@@ -123,9 +125,20 @@ impl MountedDriveCallbackAdapter {
             .iter()
             .filter(|file| !is_symbolic_link(file))
             .filter_map(|file| {
-                cloud_file_to_placeholder_entry(file, &files.remote_path).map_err(|e| {
-                    tracing::error!(target: "drive::mounts", id = %self.id, error = %e, "Failed to convert cloud file to placeholder entry");
-                }).ok()
+                let mut local_path = files.local_path.clone();
+                local_path.push(file.name.clone());
+                let path_str = local_path.to_str()?;
+                let inv = self.inventory.query_by_path(path_str).ok().flatten();
+                cloud_file_to_placeholder_entry_merged(file, &files.remote_path, inv.as_ref())
+                    .map_err(|e| {
+                        tracing::error!(
+                            target: "drive::mounts",
+                            id = %self.id,
+                            error = %e,
+                            "Failed to convert cloud file to placeholder entry"
+                        );
+                    })
+                    .ok()
             })
             .collect()
     }
@@ -139,9 +152,22 @@ impl MountedDriveCallbackAdapter {
             .files
             .iter()
             .filter_map(|f| {
-                cloud_file_to_metadata_entry(f, &drive_id, &files.local_path).map_err(|e| {
-                    tracing::error!(target: "drive::mounts", id = %self.id, error = %e, "Failed to convert cloud file to metadata entry");
-                }).ok()
+                let mut entry = cloud_file_to_metadata_entry(f, &drive_id, &files.local_path)
+                    .map_err(|e| {
+                        tracing::error!(
+                            target: "drive::mounts",
+                            id = %self.id,
+                            error = %e,
+                            "Failed to convert cloud file to metadata entry"
+                        );
+                    })
+                    .ok()?;
+                if !entry.is_folder {
+                    if let Ok(Some(meta)) = self.inventory.query_by_path(&entry.local_path) {
+                        entry.size = entry.size.max(meta.size);
+                    }
+                }
+                Some(entry)
             })
             .collect::<Vec<MetadataEntry>>();
         if let Err(e) = self.inventory.batch_insert(&entries) {

@@ -317,6 +317,11 @@ pub fn run() {
             if argv.len() > 1 {
                 let _ = app.emit("deeplink", argv[1].clone());
                 show_add_drive_window_impl(app);
+            } else {
+                #[cfg(target_os = "macos")]
+                {
+                    show_settings_window_impl(app);
+                }
             }
             // when defining deep link schemes at runtime, you must also check `argv` here
         }))
@@ -366,6 +371,11 @@ pub fn run() {
                 let _ = window.destroy();
             }
 
+            #[cfg(target_os = "macos")]
+            {
+                show_settings_window_impl(&app.handle());
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -374,6 +384,8 @@ pub fn run() {
             commands::remove_drive,
             commands::get_sync_status,
             commands::get_status_summary,
+            commands::resolve_sync_conflict,
+            commands::retry_sync_task,
             commands::get_drives_info,
             commands::get_file_icon,
             commands::show_file_in_explorer,

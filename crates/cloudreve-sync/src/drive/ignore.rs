@@ -76,6 +76,10 @@ impl IgnoreMatcher {
         builder.add(Glob::new("**/.~lock.*")?);
         builder.add(Glob::new("**/~*.tmp")?);
 
+        // macOS metadata (always ignored; do not depend on per-drive ignore_patterns)
+        builder.add(Glob::new("**/.DS_Store")?);
+        builder.add(Glob::new("**/.DS_*")?);
+
         let globset = builder
             .build()
             .context("Failed to build ignore pattern matcher")?;
@@ -259,9 +263,17 @@ mod tests {
         ];
         let matcher = IgnoreMatcher::new(&patterns, sync_root.clone()).unwrap();
 
-        // One user pattern plus built-in office temp patterns (~*, .~lock.*, ~*.tmp)
-        assert_eq!(matcher.len(), 4);
+        // One user pattern plus built-ins (office temps + macOS .DS_*)
+        assert_eq!(matcher.len(), 6);
         assert!(matcher.is_match(under_sync("file.tmp")));
+    }
+
+    #[test]
+    fn test_macos_ds_metadata_built_in() {
+        let sync_root = sample_sync_root();
+        let matcher = IgnoreMatcher::new(&[], sync_root.clone()).unwrap();
+        assert!(matcher.is_match(under_sync(".DS_Store")));
+        assert!(matcher.is_match(under_sync("Photos/.DS_Store")));
     }
 
     #[test]

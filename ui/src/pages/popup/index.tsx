@@ -19,11 +19,12 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useTranslation } from "react-i18next";
 import Settings from "../../common/icons/Settings";
 import CloudreveLogo from "../../common/CloudreveLogo";
-import type { StatusSummary } from "./types";
+import type { StatusSummary, TaskRecord, TaskWithProgress } from "./types";
 import type { DriveInfo } from "../settings/types";
 import DriveChips from "./DriveChips";
-import DriveStatusOverview from "./DriveStatusOverview";
+import DriveStatusOverview, { type TaskListFilterMode } from "./DriveStatusOverview";
 import TaskItem from "./TaskItem";
+import { isDotHiddenPath } from "./utils";
 
 export default function Popup() {
   const { t } = useTranslation();
@@ -32,7 +33,9 @@ export default function Popup() {
   const [selectedDrive, setSelectedDrive] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [uiError, setUiError] = useState("");
+  const [taskListFilter, setTaskListFilter] = useState<TaskListFilterMode>("all");
   const isFetchingRef = useRef(false);
+  const fetchPendingRef = useRef(false);
 
   // Close window on blur (when it loses focus)
   useEffect(() => {
@@ -58,7 +61,10 @@ export default function Popup() {
 
   // Fetch status summary
   const fetchSummary = useCallback(async () => {
-    if (isFetchingRef.current) return;
+    if (isFetchingRef.current) {
+      fetchPendingRef.current = true;
+      return;
+    }
 
     isFetchingRef.current = true;
     try {
@@ -81,8 +87,12 @@ export default function Popup() {
     } finally {
       isFetchingRef.current = false;
       setLoading(false);
+      if (fetchPendingRef.current) {
+        fetchPendingRef.current = false;
+        void fetchSummary();
+      }
     }
-  }, []);
+  }, [t]);
 
   // Initial fetch and polling
   useEffect(() => {
@@ -142,17 +152,50 @@ export default function Popup() {
     }
   };
 
+  const activeTasksVisible = (summary?.active_tasks ?? []).filter(
+    (task) => !isDotHiddenPath(task.local_path)
+  );
+  const finishedTasksVisible = (summary?.finished_tasks ?? []).filter(
+    (task) => !isDotHiddenPath(task.local_path)
+  );
+
   const displayedActiveTasks = selectedDrive
-    ? (summary?.active_tasks ?? []).filter((task) => task.drive_id === selectedDrive)
-    : (summary?.active_tasks ?? []);
+    ? activeTasksVisible.filter((task) => task.drive_id === selectedDrive)
+    : activeTasksVisible;
   const displayedFinishedTasks = selectedDrive
-    ? (summary?.finished_tasks ?? []).filter((task) => task.drive_id === selectedDrive)
-    : (summary?.finished_tasks ?? []);
+    ? finishedTasksVisible.filter((task) => task.drive_id === selectedDrive)
+    : finishedTasksVisible;
 
   const hasActiveTasks =
     displayedActiveTasks.length > 0;
   const hasFinishedTasks =
     displayedFinishedTasks.length > 0;
+
+  const isFailedOrCancelled = (task: TaskRecord | TaskWithProgress) =>
+    task.status === "Failed" || task.status === "Cancelled";
+
+  const listActiveTasks =
+    taskListFilter === "failed"
+      ? displayedActiveTasks.filter(isFailedOrCancelled)
+      : displayedActiveTasks;
+  const listFinishedTasks =
+    taskListFilter === "failed"
+      ? displayedFinishedTasks.filter(isFailedOrCancelled)
+      : taskListFilter === "active"
+        ? []
+        : displayedFinishedTasks;
+
+  const hasListActive = listActiveTasks.length > 0;
+  const hasListFinished = listFinishedTasks.length > 0;
+  const hasFilteredListContent = hasListActive || hasListFinished;
+
+  const handleTaskListFilterChipClick = (kind: "all" | "active" | "failed") => {
+    if (kind === "all") {
+      setTaskListFilter("all");
+      return;
+    }
+    setTaskListFilter((prev) => (prev === kind ? "all" : kind));
+  };
   const selectedDriveInfo = selectedDrive
     ? driveInfos.find((drive) => drive.id === selectedDrive) ?? null
     : null;
@@ -210,10 +253,12 @@ export default function Popup() {
       <DriveStatusOverview
         drives={driveInfos}
         selectedDrive={selectedDrive}
-        activeTasks={summary?.active_tasks ?? []}
-        finishedTasks={summary?.finished_tasks ?? []}
+        activeTasks={activeTasksVisible}
+        finishedTasks={finishedTasksVisible}
         onOpenFolder={handleOpenFolder}
         onReauthorize={handleReauthorize}
+        taskListFilter={taskListFilter}
+        onTaskListFilterChipClick={handleTaskListFilterChipClick}
       />
 
       {/* Task List */}
@@ -247,10 +292,44 @@ export default function Popup() {
               {t("popup.noActivity", "No recent activity")}
             </Typography>
           </Box>
+        ) : taskListFilter === "failed" && !hasFilteredListContent ? (
+          <Box
+            sx={{
+              display: "flex",
+              flexDirection: "column",
+              justifyContent: "center",
+              alignItems: "center",
+              height: "100%",
+              gap: 1,
+              px: 2,
+            }}
+          >
+            <CheckCircleIcon sx={{ fontSize: 48, color: "success.main" }} />
+            <Typography variant="body2" color="text.secondary" textAlign="center">
+              {t("popup.noFailedTasks", "No failed items in this view.")}
+            </Typography>
+          </Box>
+        ) : taskListFilter === "active" && !hasFilteredListContent ? (
+          <Box
+            sx={{
+              display: "flex",
+              flexDirection: "column",
+              justifyContent: "center",
+              alignItems: "center",
+              height: "100%",
+              gap: 1,
+              px: 2,
+            }}
+          >
+            <FolderIcon sx={{ fontSize: 48, color: "text.disabled" }} />
+            <Typography variant="body2" color="text.secondary" textAlign="center">
+              {t("popup.noActiveTasksFilter", "No active tasks in this view.")}
+            </Typography>
+          </Box>
         ) : (
           <List disablePadding>
             {/* Active Tasks */}
-            {hasActiveTasks && (
+            {hasListActive && (
               <>
                 <Typography
                   variant="caption"
@@ -266,24 +345,27 @@ export default function Popup() {
                 >
                   {t("popup.syncing", "Syncing")}
                 </Typography>
-                {displayedActiveTasks.map((task) => (
+                {listActiveTasks.map((task) => (
                   <TaskItem
                     key={task.id}
                     task={task}
                     isActive
                     onRevealPath={handleOpenFolder}
+                    onConflictResolved={fetchSummary}
+                    onSyncActionError={setUiError}
+                    onRetry={fetchSummary}
                   />
                 ))}
               </>
             )}
 
             {/* Divider between active and finished */}
-            {hasActiveTasks && hasFinishedTasks && (
+            {hasListActive && hasListFinished && (
               <Divider sx={{ my: 1 }} />
             )}
 
             {/* Finished Tasks */}
-            {hasFinishedTasks && (
+            {hasListFinished && (
               <>
                 <Typography
                   variant="caption"
@@ -299,11 +381,14 @@ export default function Popup() {
                 >
                   {t("popup.recent", "Recent")}
                 </Typography>
-                {displayedFinishedTasks.map((task) => (
+                {listFinishedTasks.map((task) => (
                   <TaskItem
                     key={task.id}
                     task={task}
                     onRevealPath={handleOpenFolder}
+                    onConflictResolved={fetchSummary}
+                    onSyncActionError={setUiError}
+                    onRetry={fetchSummary}
                   />
                 ))}
               </>

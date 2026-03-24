@@ -247,7 +247,7 @@ pub async fn add_drive(
         enabled: true,
         user_id: config.user_id,
         mount_id: None,
-        ignore_patterns: vec![".DS_Store".to_string()],
+        ignore_patterns: vec![".DS_Store".to_string(), ".DS_*".to_string()],
         extra: Default::default(),
     };
 
@@ -325,6 +325,38 @@ pub async fn get_status_summary(
     app_state
         .drive_manager
         .get_status_summary(drive_id.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Resolve a sync conflict for a file (same semantics as Windows: keep remote / overwrite / save as new).
+#[tauri::command]
+pub async fn resolve_sync_conflict(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+    local_path: String,
+    action: String,
+) -> CommandResult<()> {
+    let app_state = state.wait_for_ready().await;
+    app_state
+        .drive_manager
+        .resolve_sync_conflict(&drive_id, &local_path, &action)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Re-queue an upload or download for a local path (e.g. retry after a network error).
+#[tauri::command]
+pub async fn retry_sync_task(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+    local_path: String,
+    task_type: String,
+) -> CommandResult<()> {
+    let app_state = state.wait_for_ready().await;
+    app_state
+        .drive_manager
+        .retry_sync_task(&drive_id, &local_path, &task_type)
         .await
         .map_err(|e| e.to_string())
 }
@@ -546,6 +578,10 @@ pub async fn show_settings_window(app: AppHandle) -> CommandResult<()> {
 pub fn show_settings_window_impl(app: &AppHandle) {
     // Check if window already exists
     if let Some(window) = app.get_webview_window("settings") {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+        }
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
@@ -567,6 +603,27 @@ pub fn show_settings_window_impl(app: &AppHandle) {
 
     match builder.build() {
         Ok(window) => {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+                let app_handle = app.clone();
+                let window_handle = window.clone();
+                window.on_window_event(move |event| {
+                    match event {
+                        tauri::WindowEvent::CloseRequested { api, .. } => {
+                            api.prevent_close();
+                            let _ = window_handle.hide();
+                            let _ = app_handle
+                                .set_activation_policy(tauri::ActivationPolicy::Accessory);
+                        }
+                        tauri::WindowEvent::Destroyed => {
+                            let _ = app_handle
+                                .set_activation_policy(tauri::ActivationPolicy::Accessory);
+                        }
+                        _ => {}
+                    }
+                });
+            }
             let _ = window.move_window(Position::Center);
             let _ = window.show();
             let _ = window.set_focus();

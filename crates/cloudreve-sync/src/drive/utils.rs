@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use cloudreve_api::api::ExplorerApi;
+use cloudreve_api::models::explorer::{FileURLResponse, FileURLService};
 use cloudreve_api::models::uri::{CrUri, CR_URI_PREFIX};
+use cloudreve_api::{ApiError, Client};
 use cloudreve_platforms_api::VirtualFileState;
 use url::Url;
 
@@ -149,7 +152,7 @@ pub fn local_state_matches_inventory(
         return false;
     }
 
-    if !inventory.is_folder && local.file_size != Some(inventory.size as u64) {
+    if !inventory.is_folder && local.file_size != Some(inventory.size.max(0) as u64) {
         return false;
     }
 
@@ -158,6 +161,26 @@ pub fn local_state_matches_inventory(
     };
 
     (last_modified_unix - inventory.updated_at).abs() <= MTIME_TOLERANCE_SECS
+}
+
+/// Like [`local_state_matches_inventory`] without mtime (used for pull vs upload in real-file sync).
+pub fn local_bytes_match_inventory(
+    local: &VirtualFileState,
+    inventory: Option<&FileMetadata>,
+) -> bool {
+    let Some(inventory) = inventory else {
+        return false;
+    };
+
+    if !local.exists || local.is_directory != inventory.is_folder {
+        return false;
+    }
+
+    if !inventory.is_folder && local.file_size != Some(inventory.size.max(0) as u64) {
+        return false;
+    }
+
+    true
 }
 
 /// Generate a URL to view a folder or file online.
@@ -199,9 +222,44 @@ pub fn recycle_bin_url(config: &DriveConfig) -> Result<String> {
     Ok(base.to_string())
 }
 
+/// Request signed download URLs for `uri`. If the server returns a batch error (40081) while an
+/// `entity` hint was sent — common when metadata is stale after a file was created on the server —
+/// retry once without `entity`.
+pub async fn get_file_url_with_entity_fallback(
+    client: &Client,
+    uri: &str,
+    entity: Option<String>,
+) -> anyhow::Result<FileURLResponse> {
+    let mut request = FileURLService::default();
+    request.uris.push(uri.to_string());
+    request.entity = entity.clone();
+
+    match client.get_file_url(&request).await {
+        Ok(res) => Ok(res),
+        Err(e) if entity.is_some() && matches!(&e, ApiError::BatchError { .. }) => {
+            tracing::warn!(
+                target: "drive::utils",
+                uri = %uri,
+                error = %e,
+                "get_file_url failed with entity hint; retrying without entity"
+            );
+            let mut retry = FileURLService::default();
+            retry.uris.push(uri.to_string());
+            client
+                .get_file_url(&retry)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))
+        }
+        Err(e) => Err(anyhow::anyhow!(e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{cr_uri_for_fs_event_path, local_path_to_cr_uri, local_state_matches_inventory};
+    use super::{
+        cr_uri_for_fs_event_path, local_bytes_match_inventory, local_path_to_cr_uri,
+        local_state_matches_inventory,
+    };
     use crate::inventory::{FileMetadata, InventoryDb, MetadataEntry};
     use cloudreve_platforms_api::{LocalAvailability, VirtualFileState};
     use std::collections::HashMap;
@@ -261,6 +319,23 @@ mod tests {
         let mut inventory = sample_inventory();
         inventory.updated_at += 2;
         assert!(!local_state_matches_inventory(&state, Some(&inventory)));
+    }
+
+    #[test]
+    fn bytes_match_ignores_mtime_for_none_mode_pull_decision() {
+        let state = sample_state();
+        let mut inventory = sample_inventory();
+        inventory.updated_at += 12345;
+        assert!(!local_state_matches_inventory(&state, Some(&inventory)));
+        assert!(local_bytes_match_inventory(&state, Some(&inventory)));
+    }
+
+    #[test]
+    fn bytes_match_rejects_when_file_size_differs() {
+        let mut state = sample_state();
+        state.file_size = Some(0);
+        let inventory = sample_inventory();
+        assert!(!local_bytes_match_inventory(&state, Some(&inventory)));
     }
 
     #[test]

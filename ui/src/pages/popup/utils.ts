@@ -21,6 +21,11 @@ export function getFileName(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
+/** Basename starts with `.` (hidden / temp files like `.name.cloudreve-download-*.tmp`). */
+export function isDotHiddenPath(path: string): boolean {
+  return getFileName(path).startsWith(".");
+}
+
 export function getParentFolderName(path: string): string {
   const parts = path.split(/[/\\]/);
   // Remove the file name to get parent path parts

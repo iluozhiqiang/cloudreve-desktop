@@ -4,6 +4,7 @@ import {
   Button,
   Chip,
   Stack,
+  Tooltip,
   Typography,
 } from "@mui/material";
 import {
@@ -16,7 +17,10 @@ import {
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import type { DriveInfo } from "../settings/types";
+import { getFriendlyTaskError } from "./taskErrorMessage";
 import type { TaskRecord, TaskWithProgress } from "./types";
+
+export type TaskListFilterMode = "all" | "active" | "failed";
 
 interface DriveStatusOverviewProps {
   drives: DriveInfo[];
@@ -25,6 +29,9 @@ interface DriveStatusOverviewProps {
   finishedTasks: TaskRecord[];
   onOpenFolder: (path: string) => void;
   onReauthorize: (drive: DriveInfo) => void;
+  taskListFilter: TaskListFilterMode;
+  /** `all` sets filter to show everything; active/failed toggle off when clicked again. */
+  onTaskListFilterChipClick: (kind: "all" | "active" | "failed") => void;
 }
 
 function getStatusColor(status: DriveInfo["status"]) {
@@ -77,6 +84,8 @@ export default function DriveStatusOverview({
   finishedTasks,
   onOpenFolder,
   onReauthorize,
+  taskListFilter,
+  onTaskListFilterChipClick,
 }: DriveStatusOverviewProps) {
   const { t } = useTranslation();
 
@@ -98,12 +107,15 @@ export default function DriveStatusOverview({
     });
 
     finishedTasks.forEach((task) => {
-      if (task.status !== "Failed") {
+      if (task.status !== "Failed" && task.status !== "Cancelled") {
         return;
       }
       const entry = ensure(task.drive_id);
       entry.failed += 1;
-      if (!entry.lastFailed || task.updated_at > entry.lastFailed.updated_at) {
+      if (
+        task.status === "Failed" &&
+        (!entry.lastFailed || task.updated_at > entry.lastFailed.updated_at)
+      ) {
         entry.lastFailed = task;
       }
     });
@@ -116,6 +128,15 @@ export default function DriveStatusOverview({
     ? drives.find((drive) => drive.id === selectedDrive) ?? null
     : null;
   const activeTaskCount = activeTasks.length;
+  const totalListedTaskCount = activeTaskCount + finishedTasks.length;
+  const globalFailedCount = useMemo(() => {
+    const failedLike = (task: TaskRecord) =>
+      task.status === "Failed" || task.status === "Cancelled";
+    return (
+      activeTasks.filter((task) => failedLike(task)).length +
+      finishedTasks.filter((task) => failedLike(task)).length
+    );
+  }, [activeTasks, finishedTasks]);
 
   if (drives.length === 0) {
     return null;
@@ -126,29 +147,57 @@ export default function DriveStatusOverview({
       <Box sx={{ px: 2, py: 1.5, borderBottom: 1, borderColor: "divider" }}>
         <Stack direction="row" spacing={1}>
           <Box
+            component="button"
+            type="button"
+            onClick={() => onTaskListFilterChipClick("all")}
             sx={{
               flex: 1,
               p: 1,
               borderRadius: 1.5,
-              bgcolor: "action.hover",
+              border: 1,
+              borderColor:
+                taskListFilter === "all" ? "primary.main" : "divider",
+              bgcolor:
+                taskListFilter === "all" ? "primary.main" : "action.hover",
+              color: taskListFilter === "all" ? "primary.contrastText" : "text.primary",
+              cursor: "pointer",
+              textAlign: "left",
+              font: "inherit",
             }}
           >
-            <Typography variant="caption" color="text.secondary">
-              {t("popup.drivesCount", "Drives")}
+            <Typography
+              variant="caption"
+              color={taskListFilter === "all" ? "inherit" : "text.secondary"}
+            >
+              {t("popup.taskFilterAll", "All")}
             </Typography>
             <Typography variant="body2" fontWeight={600}>
-              {drives.length}
+              {totalListedTaskCount}
             </Typography>
           </Box>
           <Box
+            component="button"
+            type="button"
+            onClick={() => onTaskListFilterChipClick("active")}
             sx={{
               flex: 1,
               p: 1,
               borderRadius: 1.5,
-              bgcolor: "action.hover",
+              border: 1,
+              borderColor:
+                taskListFilter === "active" ? "primary.main" : "divider",
+              bgcolor:
+                taskListFilter === "active" ? "primary.main" : "action.hover",
+              color: taskListFilter === "active" ? "primary.contrastText" : "text.primary",
+              cursor: "pointer",
+              textAlign: "left",
+              font: "inherit",
             }}
           >
-            <Typography variant="caption" color="text.secondary">
+            <Typography
+              variant="caption"
+              color={taskListFilter === "active" ? "inherit" : "text.secondary"}
+            >
               {t("popup.activeTasks", "Active tasks")}
             </Typography>
             <Typography variant="body2" fontWeight={600}>
@@ -156,22 +205,32 @@ export default function DriveStatusOverview({
             </Typography>
           </Box>
           <Box
+            component="button"
+            type="button"
+            onClick={() => onTaskListFilterChipClick("failed")}
             sx={{
               flex: 1,
               p: 1,
               borderRadius: 1.5,
-              bgcolor: issueDrives.length > 0 ? "warning.light" : "action.hover",
-              color: issueDrives.length > 0 ? "warning.contrastText" : "text.primary",
+              border: 1,
+              borderColor:
+                taskListFilter === "failed" ? "error.main" : "divider",
+              bgcolor:
+                taskListFilter === "failed" ? "error.main" : "action.hover",
+              color: taskListFilter === "failed" ? "error.contrastText" : "text.primary",
+              cursor: "pointer",
+              textAlign: "left",
+              font: "inherit",
             }}
           >
             <Typography
               variant="caption"
-              color={issueDrives.length > 0 ? "inherit" : "text.secondary"}
+              color={taskListFilter === "failed" ? "inherit" : "text.secondary"}
             >
-              {t("popup.needsAttention", "Needs attention")}
+              {t("popup.failedTasks", "Failed")}
             </Typography>
             <Typography variant="body2" fontWeight={600}>
-              {issueDrives.length}
+              {globalFailedCount}
             </Typography>
           </Box>
         </Stack>
@@ -211,10 +270,21 @@ export default function DriveStatusOverview({
           />
         </Box>
 
-        <Stack direction="row" spacing={1}>
+        <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
           <Chip
             size="small"
-            variant="outlined"
+            clickable
+            onClick={() => onTaskListFilterChipClick("all")}
+            variant={taskListFilter === "all" ? "filled" : "outlined"}
+            color={taskListFilter === "all" ? "primary" : "default"}
+            label={t("popup.taskFilterAll", "All")}
+          />
+          <Chip
+            size="small"
+            clickable
+            onClick={() => onTaskListFilterChipClick("active")}
+            variant={taskListFilter === "active" ? "filled" : "outlined"}
+            color={taskListFilter === "active" ? "primary" : "default"}
             icon={
               stats.active > 0 ? (
                 <RefreshIcon sx={{ fontSize: 16 }} />
@@ -229,7 +299,10 @@ export default function DriveStatusOverview({
           />
           <Chip
             size="small"
-            variant="outlined"
+            clickable
+            onClick={() => onTaskListFilterChipClick("failed")}
+            variant={taskListFilter === "failed" ? "filled" : "outlined"}
+            color={taskListFilter === "failed" ? "error" : "default"}
             icon={<ErrorOutlineIcon sx={{ fontSize: 16 }} />}
             label={t("popup.failedTasksCount", {
               count: stats.failed,
@@ -249,9 +322,20 @@ export default function DriveStatusOverview({
 
         {stats.lastFailed?.error && (
           <Alert severity="error" sx={{ py: 0 }}>
-            <Typography variant="caption" sx={{ wordBreak: "break-word" }}>
-              {stats.lastFailed.error}
-            </Typography>
+            <Tooltip title={stats.lastFailed.error} placement="top-start" enterDelay={300}>
+              <Typography
+                variant="caption"
+                sx={{
+                  wordBreak: "break-word",
+                  display: "-webkit-box",
+                  WebkitLineClamp: 3,
+                  WebkitBoxOrient: "vertical",
+                  overflow: "hidden",
+                }}
+              >
+                {getFriendlyTaskError(stats.lastFailed.error, t)}
+              </Typography>
+            </Tooltip>
           </Alert>
         )}
 

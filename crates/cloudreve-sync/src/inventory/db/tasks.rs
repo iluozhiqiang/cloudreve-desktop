@@ -94,6 +94,52 @@ impl InventoryDb {
         Ok(())
     }
 
+    /// Delete failed upload task rows for an exact drive + local path (after user resolves a conflict).
+    pub fn delete_failed_upload_tasks_for_path(
+        &self,
+        drive_id: &str,
+        local_path: &str,
+    ) -> Result<usize> {
+        let mut conn = self.connection()?;
+        let failed = TaskStatus::Failed.as_str().to_string();
+        let upload = "upload".to_string();
+        let n = diesel::delete(
+            task_queue_dsl::task_queue
+                .filter(task_queue_dsl::drive_id.eq(drive_id))
+                .filter(task_queue_dsl::local_path.eq(local_path))
+                .filter(task_queue_dsl::task_type.eq(upload))
+                .filter(task_queue_dsl::status.eq(failed)),
+        )
+        .execute(&mut conn)
+        .context("Failed to delete failed upload tasks for path")?;
+        Ok(n)
+    }
+
+    /// Delete failed or cancelled task rows for an exact drive + local path + task type.
+    /// Used when the user retries so the old failure no longer appears in recent finished tasks.
+    pub fn delete_failed_or_cancelled_tasks_for_path_kind(
+        &self,
+        drive_id: &str,
+        local_path: &str,
+        task_type: &str,
+    ) -> Result<usize> {
+        let mut conn = self.connection()?;
+        let statuses = vec![
+            TaskStatus::Failed.as_str().to_string(),
+            TaskStatus::Cancelled.as_str().to_string(),
+        ];
+        let n = diesel::delete(
+            task_queue_dsl::task_queue
+                .filter(task_queue_dsl::drive_id.eq(drive_id))
+                .filter(task_queue_dsl::local_path.eq(local_path))
+                .filter(task_queue_dsl::task_type.eq(task_type))
+                .filter(task_queue_dsl::status.eq_any(&statuses)),
+        )
+        .execute(&mut conn)
+        .context("Failed to delete failed/cancelled tasks for path kind")?;
+        Ok(n)
+    }
+
     /// Cancel all pending/running tasks matching a path or its descendants.
     /// Returns the list of task IDs that were cancelled.
     pub fn cancel_tasks_by_path(&self, drive_id: &str, path: &str) -> Result<Vec<String>> {
@@ -151,9 +197,8 @@ impl InventoryDb {
         }
     }
 
-    /// Query recent tasks for status summary.
-    /// Returns up to 25 pending/running tasks and up to 25 completed/failed/cancelled tasks,
-    /// ordered by updated_at descending.
+    /// Recent tasks for the status UI: up to 25 active and 25 finished (`updated_at` desc).
+    /// Finished list dedupes by `(drive_id, local_path, task_type)` (newest kept).
     pub fn query_recent_tasks(&self, drive_id: Option<&str>) -> Result<RecentTasks> {
         let mut conn = self.connection()?;
 
@@ -197,9 +242,10 @@ impl InventoryDb {
             finished_query = finished_query.filter(task_queue_dsl::drive_id.eq(drive));
         }
 
+        // Over-fetch so that after deduping by (drive, path, task_type) we still have up to 25 rows.
         let finished_rows = finished_query
             .order(task_queue_dsl::updated_at.desc())
-            .limit(25)
+            .limit(200)
             .load::<TaskRow>(&mut conn)
             .context("Failed to query finished tasks")?;
 
@@ -207,12 +253,28 @@ impl InventoryDb {
             .into_iter()
             .map(TaskRecord::try_from)
             .collect::<Result<Vec<_>>>()?;
+        let finished_tasks = dedupe_finished_tasks_keep_newest_first(finished_tasks);
+        let finished_tasks: Vec<TaskRecord> = finished_tasks.into_iter().take(25).collect();
 
         Ok(RecentTasks {
             active: active_tasks,
             finished: finished_tasks,
         })
     }
+}
+
+/// One row per (drive_id, local_path, task_type): query is `updated_at DESC`, so the first row wins.
+fn dedupe_finished_tasks_keep_newest_first(tasks: Vec<TaskRecord>) -> Vec<TaskRecord> {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for t in tasks {
+        let key = (t.drive_id.clone(), t.local_path.clone(), t.task_type.clone());
+        if seen.insert(key) {
+            out.push(t);
+        }
+    }
+    out
 }
 
 /// Result of querying recent tasks

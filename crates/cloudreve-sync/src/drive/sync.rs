@@ -3,17 +3,16 @@ use crate::{
         mounts::Mount,
         placeholder::CrPlaceholder,
         utils::{
-            local_path_to_cr_uri, local_state_matches_inventory, remote_path_to_local_relative_path,
+            local_bytes_match_inventory, local_path_to_cr_uri, remote_path_to_local_relative_path,
         },
     },
     inventory::{ConflictState, FileMetadata, MetadataEntry},
+    is_real_file_sync_mode,
     tasks::TaskPayload,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use cloudreve_platforms_api::{
-    LocalAvailability, PlaceholderEntry, VirtualFileMode, VirtualFileState,
-};
+use cloudreve_platforms_api::{LocalAvailability, PlaceholderEntry, VirtualFileState};
 use cloudreve_api::{
     ApiError,
     api::explorer::ExplorerApiExt,
@@ -57,6 +56,23 @@ pub fn cloud_file_to_placeholder_entry(
         mark_in_sync: true,
         overwrite: true,
     })
+}
+
+/// Like [`cloud_file_to_placeholder_entry`], but merges `size` with inventory when the list API
+/// returns stale `0` (e.g. server-side upload still finalizing). Finder reads this for `documentSize`.
+pub fn cloud_file_to_placeholder_entry_merged(
+    file: &FileResponse,
+    remote_path: &CrUri,
+    inventory: Option<&FileMetadata>,
+) -> Result<PlaceholderEntry> {
+    let mut entry = cloud_file_to_placeholder_entry(file, remote_path)?;
+    if !entry.is_directory {
+        let list_sz = file.size;
+        let inv_sz = inventory.map(|m| m.size).unwrap_or(0);
+        let merged = list_sz.max(inv_sz);
+        entry.size = merged.max(0) as u64;
+    }
+    Ok(entry)
 }
 
 pub fn cloud_file_to_metadata_entry(
@@ -185,6 +201,13 @@ pub enum SyncMode {
 }
 
 const CONFLICT_PREFIX: &str = "__conflict__";
+
+/// Real-file sync: skip creating a local file while the listing still has `size == 0` (upload may be in progress).
+fn skip_none_mode_materialize_zero_byte_remote_file(remote: &FileResponse) -> bool {
+    is_real_file_sync_mode()
+        && remote.file_type != file_type::FOLDER
+        && remote.size == 0
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -639,9 +662,7 @@ impl Mount {
     }
 
     fn register_remote_materialization_blockers(&self, path: &Path, is_directory: bool) {
-        let is_real_file_mode = crate::platform_provider()
-            .map(|platform| platform.virtual_files().mode() == VirtualFileMode::None)
-            .unwrap_or(false);
+        let is_real_file_mode = is_real_file_sync_mode();
         let create_count = if is_real_file_mode { 2 } else { 1 };
         self.event_blocker.register(
             &EventKind::Create(CreateKind::Any),
@@ -709,10 +730,9 @@ impl Mount {
                     return;
                 }
 
-                if crate::platform_provider()
-                    .map(|platform| platform.virtual_files().mode() == VirtualFileMode::None)
-                    .unwrap_or(false)
+                if is_real_file_sync_mode()
                     && remote.file_type != file_type::FOLDER
+                    && remote.size > 0
                 {
                     self.enqueue_download_task(path, aggregate_error).await;
                 }
@@ -741,10 +761,9 @@ impl Mount {
                     return;
                 }
 
-                if crate::platform_provider()
-                    .map(|platform| platform.virtual_files().mode() == VirtualFileMode::None)
-                    .unwrap_or(false)
+                if is_real_file_sync_mode()
                     && remote.file_type != file_type::FOLDER
+                    && remote.size > 0
                 {
                     self.enqueue_download_task(path, aggregate_error).await;
                 }
@@ -1080,11 +1099,19 @@ impl Mount {
                 plan,
             ),
             (Some(remote_entry), false) => {
-                plan.actions
-                    .push(SyncAction::CreatePlaceholderAndInventory {
-                        path: path.clone(),
-                        remote: remote_entry.clone(),
-                    });
+                if skip_none_mode_materialize_zero_byte_remote_file(remote_entry) {
+                    tracing::debug!(
+                        target: "drive::sync",
+                        path = %path.display(),
+                        "Skipping local file create: remote size is 0 (wait until upload finishes)"
+                    );
+                } else {
+                    plan.actions
+                        .push(SyncAction::CreatePlaceholderAndInventory {
+                            path: path.clone(),
+                            remote: remote_entry.clone(),
+                        });
+                }
             }
             (None, true) => {
                 self.plan_entry_with_local_only(path, mode, local, inventory, plan);
@@ -1118,11 +1145,19 @@ impl Mount {
                 });
             }
 
-            plan.actions
-                .push(SyncAction::CreatePlaceholderAndInventory {
-                    path: path.clone(),
-                    remote: remote.clone(),
-                });
+            if !skip_none_mode_materialize_zero_byte_remote_file(remote) {
+                plan.actions
+                    .push(SyncAction::CreatePlaceholderAndInventory {
+                        path: path.clone(),
+                        remote: remote.clone(),
+                    });
+            } else {
+                tracing::debug!(
+                    target: "drive::sync",
+                    path = %path.display(),
+                    "Skipping recreate after type conflict: remote file size is 0"
+                );
+            }
             return;
         }
 
@@ -1140,6 +1175,22 @@ impl Mount {
             })
             .unwrap_or(false);
 
+        // Size must match too: during server-side chunked uploads the file can stay at 0 bytes while
+        // etag/modified time are unchanged; once upload finishes only `size` updates. Without this,
+        // we would skip `plan_file_actions` and never re-hydrate the local copy.
+        let size_match = inventory
+            .map(|entry| entry.size == remote.size)
+            .unwrap_or(false);
+
+        let remote_sz = remote.size.max(0) as u64;
+        let disk_needs_hydration = is_real_file_sync_mode()
+            && !remote_is_dir
+            && remote_sz > 0
+            && local
+                .file_size
+                .map(|s| s != remote_sz)
+                .unwrap_or(true);
+
         if remote_is_dir {
             if !etag_match || !modify_date_match {
                 plan.actions.push(SyncAction::UpdateInventoryFromRemote {
@@ -1152,7 +1203,7 @@ impl Mount {
             return;
         }
 
-        if !etag_match || !modify_date_match {
+        if !etag_match || !modify_date_match || !size_match || disk_needs_hydration {
             self.plan_file_actions(path, remote, local, inventory, plan);
         }
     }
@@ -1221,18 +1272,24 @@ impl Mount {
         inventory: Option<&FileMetadata>,
         plan: &mut SyncPlan,
     ) {
-        if crate::platform_provider()
-            .map(|platform| platform.virtual_files().mode() == VirtualFileMode::None)
-            .unwrap_or(false)
-        {
+        if is_real_file_sync_mode() {
             let conflicting =
                 inventory.is_some_and(|inv| inv.conflict_state == Some(ConflictState::Pending));
-            if !conflicting && local_state_matches_inventory(local, inventory) {
+            if conflicting {
+                return;
+            }
+            let remote_sz = remote.size.max(0) as u64;
+            let local_sz = local.file_size.unwrap_or(0);
+            let inv_sz = inventory.map(|i| i.size.max(0) as u64).unwrap_or(0);
+            let pull = local_bytes_match_inventory(local, inventory)
+                || (remote.file_type != file_type::FOLDER && remote_sz > local_sz)
+                || (remote.file_type != file_type::FOLDER && inv_sz > 0 && local_sz == 0);
+            if pull {
                 plan.actions.push(SyncAction::QueueDownload {
                     path: path.clone(),
                     remote: remote.clone(),
                 });
-            } else if !conflicting {
+            } else {
                 plan.actions.push(SyncAction::QueueUpload {
                     path: path.clone(),
                     reason: UploadReason::RemoteMismatch,

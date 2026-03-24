@@ -22,24 +22,17 @@ use filetime::{FileTime, set_file_mtime};
 const NOTIFICATION_COOLDOWN_SECS: u64 = 15;
 const MACOS_AUTOSTART_LABEL: &str = "xyz.cloudreve.desktop";
 
-/// 默认走最简单同步：`VirtualFileMode::None`，不启动 FPE Unix IPC。
-/// 需要 File Provider / Finder 集成时再设 `CLOUDREVE_MACOS_FPE=1`（或 `true` / `yes` / `on`）。
+/// 是否启动与 File Provider Extension 的 Unix IPC（占位符枚举 / `fetchData` 等）。
+///
+/// 产品策略：**仅使用用户选择的本地目录做全量同步**，文件以真实内容落盘（下载任务写入），**不**走 FPE 占位符模式。
+/// 如需在本仓库内调试 FPE，可临时改为 `true` 并自行构建扩展宿主。
 fn macos_fpe_ipc_enabled() -> bool {
-    match std::env::var("CLOUDREVE_MACOS_FPE") {
-        Ok(v) => {
-            let v = v.to_ascii_lowercase();
-            v == "1" || v == "true" || v == "yes" || v == "on"
-        }
-        Err(_) => false,
-    }
+    false
 }
 
+/// 始终为普通目录同步（与 Windows 上「非 Cloud Filter」路径一致）：真实文件、无虚拟占位。
 fn macos_virtual_file_mode() -> VirtualFileMode {
-    if cfg!(target_os = "macos") && macos_fpe_ipc_enabled() {
-        VirtualFileMode::FileProvider
-    } else {
-        VirtualFileMode::None
-    }
+    VirtualFileMode::None
 }
 
 #[derive(Debug, Default)]
@@ -317,7 +310,7 @@ impl PlatformMountProvider for MacosPlatformProvider {
             tracing::info!(
                 target: "platforms::macos",
                 mount_id = %context.mount_id,
-                "File Provider IPC off (simple sync); set CLOUDREVE_MACOS_FPE=1 to enable"
+                "File Provider IPC disabled; using sync root directory with full file download"
             );
             let _ = handler;
             return Ok(Box::new(NoopMountSession));
@@ -327,7 +320,7 @@ impl PlatformMountProvider for MacosPlatformProvider {
             target: "platforms::macos",
             mount_id = %context.mount_id,
             sync_path = %context.sync_path.display(),
-            "Starting File Provider IPC server for mount"
+            "Starting File Provider IPC server for mount (dev-only)"
         );
 
         file_provider_ipc::register_handler_for_mount(context.mount_id.clone(), handler)
@@ -425,9 +418,13 @@ impl VirtualFileOps for MacosPlatformProvider {
                     })?;
             }
 
-            // Converting hydrated content into a placeholder is expected when we (re)create
-            // the placeholder during remote invalidation / updates.
-            if spec.overwrite && existing_state.exists && !existing_state.is_virtual_placeholder {
+            // Placeholder / invalidation path (CF/FPE). Skip truncate in plain-directory sync: after
+            // download, markers are cleared when `len > 0`, so this would wipe real file content.
+            if macos_virtual_file_mode() != VirtualFileMode::None
+                && spec.overwrite
+                && existing_state.exists
+                && !existing_state.is_virtual_placeholder
+            {
                 OpenOptions::new()
                     .write(true)
                     .truncate(true)

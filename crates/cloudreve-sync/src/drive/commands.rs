@@ -6,6 +6,7 @@ use crate::{
         utils::{cr_uri_for_fs_event_path, local_path_to_cr_uri, local_state_matches_inventory},
     },
     inventory::{ConflictState, TaskStatus},
+    is_real_file_sync_mode,
     platform_provider,
     tasks::TaskPayload,
 };
@@ -16,7 +17,7 @@ use cloudreve_api::{
     api::{ExplorerApi, explorer::ExplorerApiExt},
     models::{
         explorer::{
-            DeleteFileService, FileResponse, FileURLService, MoveFileService, RenameFileService,
+            DeleteFileService, FileResponse, MoveFileService, RenameFileService,
             metadata,
         },
         uri::CrUri,
@@ -27,7 +28,7 @@ use notify_debouncer_full::notify::{
     Event, EventKind,
     event::{CreateKind, ModifyKind, RemoveKind, RenameMode},
 };
-use cloudreve_platforms_api::{FetchDataRequest, FileProviderItemState, LocalAvailability, VirtualFileMode, VirtualFileState};
+use cloudreve_platforms_api::{FetchDataRequest, FileProviderItemState, LocalAvailability, VirtualFileState};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -222,18 +223,18 @@ impl Mount {
             .query_by_path(path.to_str().unwrap_or(""))
             .context("failed to query metadata by path")?;
 
-        let mut file_url_request: FileURLService = FileURLService::default();
-        file_url_request.uris.push(uri.to_string());
-        if let Some(meta) = file_meta {
-            if !meta.etag.is_empty() {
-                file_url_request.entity = Some(meta.etag.clone());
-            }
-        }
-        let entity_url_res = self
-            .cr_client
-            .get_file_url(&file_url_request)
-            .await
-            .context("failed to get file url")?;
+        let entity = file_meta
+            .as_ref()
+            .filter(|m| !m.etag.is_empty())
+            .map(|m| m.etag.clone());
+
+        let entity_url_res = crate::drive::utils::get_file_url_with_entity_fallback(
+            &self.cr_client,
+            &uri.to_string(),
+            entity,
+        )
+        .await
+        .context("failed to get file url")?;
 
         // Get the download URL from the response
         let download_url = entity_url_res
@@ -491,15 +492,15 @@ impl Mount {
 
         // Cancel ongoing/pending tasks
         match self.task_queue.cancel_by_path(source.clone()).await {
-            Ok(0) => {
+            Ok(ids) if ids.is_empty() => {
                 // Mark file as in-sync
                 tracing::trace!(target: "drive::commands", path = %destination.display(), "Marking file as in-sync");
                 crate::platform_provider()?
                     .virtual_file_ops()
                     .mark_in_sync(&destination, true)
             }
-            Ok(count) => {
-                tracing::info!(target: "drive::commands", path = %source.display(), count = count, "Cancelled tasks");
+            Ok(ids) => {
+                tracing::info!(target: "drive::commands", path = %source.display(), count = ids.len(), "Cancelled tasks");
                 // We have tasks canceled, we need to trigger sync on the moved file
                 self.command_tx
                     .send(MountCommand::Sync {
@@ -802,6 +803,18 @@ impl Mount {
             }
         }
 
+        if let Err(e) = self
+            .inventory
+            .delete_failed_upload_tasks_for_path(&self.id, &local_path)
+        {
+            tracing::warn!(
+                target: "drive::commands",
+                error = %e,
+                path = %local_path,
+                "Failed to clear failed upload task after conflict resolution"
+            );
+        }
+
         Ok(())
     }
 
@@ -831,21 +844,25 @@ impl Mount {
 
             // Cancel ongoing/pending tasks
             let result = self.task_queue.cancel_by_path(event.paths[0].clone()).await;
-            match (result, to_file_info.is_in_sync()) {
-                (Ok(0), true) => {
+            match result {
+                Ok(ids) if ids.is_empty() && to_file_info.is_in_sync() => {
                     tracing::debug!(target: "drive::commands", path = %event.paths[0].display(), "No ongoing/pending tasks");
                 }
-                (Ok(count), _) => {
-                    // Trigger sync on the moved file
-                    self.command_tx
-                        .send(MountCommand::Sync {
-                            local_paths: vec![event.paths[1].clone()],
-                            mode: SyncMode::FullHierarchy,
-                        })
-                        .context("failed to send sync command")?;
-                    tracing::info!(target: "drive::commands", path = %event.paths[0].display(), count = count, "Cancelled tasks");
+                Ok(ids) => {
+                    // Trigger sync on the moved file (including empty cancel + out-of-sync, matching prior behavior)
+                    if !ids.is_empty() || !to_file_info.is_in_sync() {
+                        self.command_tx
+                            .send(MountCommand::Sync {
+                                local_paths: vec![event.paths[1].clone()],
+                                mode: SyncMode::FullHierarchy,
+                            })
+                            .context("failed to send sync command")?;
+                    }
+                    if !ids.is_empty() {
+                        tracing::info!(target: "drive::commands", path = %event.paths[0].display(), count = ids.len(), "Cancelled tasks");
+                    }
                 }
-                (Err(e), _) => {
+                Err(e) => {
                     tracing::error!(target: "drive::commands", path = %event.paths[0].display(), error = %e, "Failed to cancel tasks");
                     continue;
                 }
@@ -897,9 +914,7 @@ impl Mount {
                 continue;
             }
 
-            let real_file_mode = crate::platform_provider()
-                .map(|platform| platform.virtual_files().mode() == VirtualFileMode::None)
-                .unwrap_or(false);
+            let real_file_mode = is_real_file_sync_mode();
             let inventory_entry = path
                 .to_str()
                 .and_then(|path_str| self.inventory.query_by_path(path_str).ok().flatten());
@@ -1004,9 +1019,7 @@ impl Mount {
         );
 
         for (_remote_uri, path) in path_uri_mappings {
-            let real_file_mode = crate::platform_provider()
-                .map(|platform| platform.virtual_files().mode() == VirtualFileMode::None)
-                .unwrap_or(false);
+            let real_file_mode = is_real_file_sync_mode();
 
             if real_file_mode {
                 let local_info = match crate::platform_provider()?
@@ -1084,8 +1097,8 @@ impl Mount {
         for path in path_uri_mappings.values() {
             let result = self.task_queue.cancel_by_path(path.as_path()).await;
             match result {
-                Ok(count) => {
-                    tracing::info!(target: "drive::commands", path = %path.display(), count = count, "Cancelled tasks");
+                Ok(ids) => {
+                    tracing::info!(target: "drive::commands", path = %path.display(), count = ids.len(), "Cancelled tasks");
                 }
                 Err(e) => {
                     tracing::error!(target: "drive::commands", path = %path.display(), error = %e, "Failed to cancel tasks");

@@ -9,19 +9,89 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use chrono::DateTime;
 use cloudreve_api::{
     ApiError, Client,
     api::ExplorerApi,
     error::ErrorCode,
-    models::explorer::{CreateFileService, FileResponse, FileUpdateService, file_type},
+    models::explorer::{
+        CreateFileService, FileResponse, FileUpdateService, GetFileInfoService, file_type,
+    },
 };
-use cloudreve_platforms_api::VirtualFileMode;
+use cloudreve_platforms_api::{VirtualFileMode, VirtualFileState};
 use dashmap::DashMap;
+use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::types::TaskProgress;
+
+fn is_api_error_code_in_chain(err: &anyhow::Error, want: i32) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<ApiError>()
+            .is_some_and(|api_err| matches!(api_err, ApiError::ApiError { code, .. } if *code == want))
+    })
+}
+
+/// Remote `updated_at` vs local mtime may differ by 1–2s (FS / server rounding).
+const OBJECT_EXISTED_MTIME_TOLERANCE_SECS: i64 = 2;
+
+#[derive(Debug, Error)]
+#[error("remote file exists but size or modification time does not match local")]
+struct ObjectExistedMetadataMismatch;
+
+/// When the server reports 40004, we only auto-resolve if local and remote look like the same content.
+fn local_matches_remote_object_existed(file: &FileResponse, local: &VirtualFileState) -> bool {
+    if !local.exists {
+        return false;
+    }
+    if local.is_directory != (file.file_type == file_type::FOLDER) {
+        return false;
+    }
+    let remote_size = file.size;
+    let Some(local_size) = local.file_size.map(|s| s as i64) else {
+        warn!(target: "tasks::upload", "ObjectExisted compare: missing local file_size");
+        return false;
+    };
+    if local_size != remote_size {
+        info!(
+            target: "tasks::upload",
+            local_size,
+            remote_size,
+            "ObjectExisted compare: size mismatch"
+        );
+        return false;
+    }
+
+    let remote_ts = DateTime::parse_from_rfc3339(&file.updated_at)
+        .ok()
+        .map(|dt| dt.timestamp());
+    let local_ts = local.last_modified_unix;
+
+    match (remote_ts, local_ts) {
+        (Some(r), Some(l)) => {
+            let ok = (r - l).abs() <= OBJECT_EXISTED_MTIME_TOLERANCE_SECS;
+            if !ok {
+                info!(
+                    target: "tasks::upload",
+                    remote_mtime = r,
+                    local_mtime = l,
+                    "ObjectExisted compare: mtime outside tolerance"
+                );
+            }
+            ok
+        }
+        _ => {
+            info!(
+                target: "tasks::upload",
+                "ObjectExisted compare: missing mtime on one side; accepting size-only match"
+            );
+            true
+        }
+    }
+}
 
 /// Progress reporter that updates task progress in-memory via a DashMap reference.
 /// Does NOT persist to inventory - only keeps in-memory for real-time queries.
@@ -172,69 +242,96 @@ impl<'a> UploadTask<'a> {
         self.handle_error(upload_res).await
     }
 
+    fn mark_conflict_pending_and_notify(&self) {
+        let path_str = self.task.payload.local_path.to_str().unwrap_or_default();
+        if let Err(mark_err) = self
+            .inventory
+            .mark_as_conflicted(path_str, Some(ConflictState::Pending))
+        {
+            warn!(
+                target: "tasks::upload",
+                task_id = %self.task.task_id,
+                local_path = %self.task.payload.local_path_display(),
+                error = ?mark_err,
+                "Failed to mark file as conflicted"
+            );
+        }
+
+        if let Ok(platform) = platform_provider() {
+            platform.desktop_integration().send_conflict_notification(
+                self.drive_id,
+                &self.task.payload.local_path,
+                self.inventory_meta
+                    .as_ref()
+                    .map(|meta| meta.id)
+                    .unwrap_or(0),
+            )
+        }
+    }
+
     async fn handle_error(&mut self, r: Result<()>) -> Result<()> {
         match r {
             Ok(()) => Ok(()),
             Err(e) => {
-                // Check if the error is an ApiError with StaleVersion (40076)
-                // The error might be wrapped with anyhow context, so check the chain
-                let is_conflict_error = e.chain().any(|cause| {
-                    if let Some(api_err) = cause.downcast_ref::<ApiError>() {
-                        matches!(
-                            api_err,
-                            ApiError::ApiError { code, .. }
-                                if *code == ErrorCode::StaleVersion as i32
-                                || *code == ErrorCode::ObjectExisted as i32
-                        )
-                    } else {
-                        false
+                // Remote already has this path — only treat as success if local size/mtime match remote.
+                if is_api_error_code_in_chain(&e, ErrorCode::ObjectExisted as i32) {
+                    info!(
+                        target: "tasks::upload",
+                        task_id = %self.task.task_id,
+                        local_path = %self.task.payload.local_path_display(),
+                        "Object already exists on server; checking metadata before aligning inventory"
+                    );
+                    match self.align_inventory_on_object_existed().await {
+                        Ok(()) => return Ok(()),
+                        Err(align_err) if align_err.is::<ObjectExistedMetadataMismatch>() => {
+                            warn!(
+                                target: "tasks::upload",
+                                task_id = %self.task.task_id,
+                                local_path = %self.task.payload.local_path_display(),
+                                "ObjectExisted but local vs remote size/mtime differ — conflict"
+                            );
+                            self.mark_conflict_pending_and_notify();
+                            if let Err(state_err) = self
+                                .local_file
+                                .as_mut()
+                                .unwrap()
+                                .update_sync_error_state(true)
+                            {
+                                warn!(target: "tasks::upload", task_id = %self.task.task_id, error = ?state_err, "Failed to update sync error state");
+                            }
+                            return Err(align_err.context(e));
+                        }
+                        Err(align_err) => {
+                            warn!(
+                                target: "tasks::upload",
+                                task_id = %self.task.task_id,
+                                error = %align_err,
+                                "Failed to align inventory after ObjectExisted; surfacing original error"
+                            );
+                        }
                     }
-                });
+                }
 
-                if is_conflict_error {
+                // StaleVersion (40076): true version conflict — keep conflict flow.
+                let is_stale_version = is_api_error_code_in_chain(&e, ErrorCode::StaleVersion as i32);
+
+                if is_stale_version {
                     warn!(
                         target: "tasks::upload",
                         task_id = %self.task.task_id,
                         local_path = %self.task.payload.local_path_display(),
-                        "Conflict detected, server has newer version or object exists"
+                        "Stale version / conflict with server"
                     );
-
-                    // Mark the file as conflicted in the inventory
-                    let path_str = self.task.payload.local_path.to_str().unwrap_or_default();
-                    if let Err(mark_err) = self
-                        .inventory
-                        .mark_as_conflicted(path_str, Some(ConflictState::Pending))
-                    {
-                        warn!(
-                            target: "tasks::upload",
-                            task_id = %self.task.task_id,
-                            local_path = %self.task.payload.local_path_display(),
-                            error = ?mark_err,
-                            "Failed to mark file as conflicted"
-                        );
-                    }
-
-                    // Send conflict toast
-                    if let Ok(platform) = platform_provider() {
-                        platform.desktop_integration().send_conflict_notification(
-                            self.drive_id,
-                            &self.task.payload.local_path,
-                            self.inventory_meta
-                                .as_ref()
-                                .map(|meta| meta.id)
-                                .unwrap_or(0),
-                        )
-                    }
+                    self.mark_conflict_pending_and_notify();
                 }
 
-                // Mark file as error state
-                if let Err(e) = self
+                if let Err(state_err) = self
                     .local_file
                     .as_mut()
                     .unwrap()
                     .update_sync_error_state(true)
                 {
-                    warn!(target: "tasks::upload", task_id = %self.task.task_id, local_path = %self.task.payload.local_path_display(), error = ?e, "Failed to update sync error state");
+                    warn!(target: "tasks::upload", task_id = %self.task.task_id, local_path = %self.task.payload.local_path_display(), error = ?state_err, "Failed to update sync error state");
                 }
                 Err(e)
             }
@@ -348,9 +445,7 @@ impl<'a> UploadTask<'a> {
         Ok(())
     }
 
-    /// Finalize upload by updating local file placeholder
-    async fn finalize_upload(&mut self) -> Result<()> {
-        // Get file info from server to confirm upload
+    async fn fetch_remote_file_info(&self) -> Result<FileResponse> {
         let uri = local_path_to_cr_uri(
             self.task.payload.local_path.clone(),
             self.sync_path.clone(),
@@ -359,20 +454,46 @@ impl<'a> UploadTask<'a> {
         .context("failed to convert local path to cloudreve uri")?
         .to_string();
 
-        let file_info = self
-            .cr_client
-            .get_file_info(&cloudreve_api::models::explorer::GetFileInfoService {
+        self.cr_client
+            .get_file_info(&GetFileInfoService {
                 uri: Some(uri),
                 id: None,
                 extended: None,
                 folder_summary: None,
             })
             .await
-            .context("failed to get file info after upload")?;
+            .context("failed to get file info from server")
+    }
+
+    /// After a successful chunked upload, pull remote row and commit (no local compare).
+    async fn pull_remote_into_inventory(&mut self) -> Result<()> {
+        let file_info = self.fetch_remote_file_info().await?;
+        self.file_uploaded(&file_info)
+            .context("failed to commit remote file metadata")?;
+        Ok(())
+    }
+
+    /// 40004: remote path exists — only auto-resolve if size and mtime match local (within tolerance).
+    async fn align_inventory_on_object_existed(&mut self) -> Result<()> {
+        let file_info = self.fetch_remote_file_info().await?;
+        let local = &self
+            .local_file
+            .as_ref()
+            .context("local_file missing for ObjectExisted align")?
+            .local_file_info;
+
+        if !local_matches_remote_object_existed(&file_info, local) {
+            return Err(ObjectExistedMetadataMismatch.into());
+        }
 
         self.file_uploaded(&file_info)
-            .context("failed to commit uploaded file")?;
+            .context("failed to commit remote file metadata")?;
         Ok(())
+    }
+
+    /// Finalize upload by updating local file placeholder
+    async fn finalize_upload(&mut self) -> Result<()> {
+        self.pull_remote_into_inventory().await
     }
 
     async fn create_empty_file_or_folder(&mut self) -> Result<()> {
@@ -409,7 +530,21 @@ impl<'a> UploadTask<'a> {
             .await;
         match res {
             Ok(folder) => self.file_uploaded(&folder),
-            Err(e) => Err(e.into()),
+            Err(e) => {
+                if matches!(
+                    &e,
+                    ApiError::ApiError { code, .. } if *code == ErrorCode::ObjectExisted as i32
+                ) {
+                    info!(
+                        target: "tasks::upload",
+                        task_id = %self.task.task_id,
+                        local_path = %self.task.payload.local_path_display(),
+                        "Create returned ObjectExisted; aligning inventory"
+                    );
+                    return self.align_inventory_on_object_existed().await;
+                }
+                Err(e.into())
+            }
         }
     }
 
